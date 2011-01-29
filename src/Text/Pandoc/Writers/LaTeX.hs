@@ -151,8 +151,8 @@ inCmd cmd contents = char '\\' <> text cmd <> braces contents
 -- (because it's illegal to have verbatim inside some command arguments)
 deVerb :: [Inline] -> [Inline]
 deVerb [] = []
-deVerb ((Code str):rest) = 
-  (TeX $ "\\texttt{" ++ stringToLaTeX str ++ "}"):(deVerb rest)
+deVerb ((Code _ str):rest) = 
+  (RawInline "latex" $ "\\texttt{" ++ stringToLaTeX str ++ "}"):(deVerb rest)
 deVerb (other:rest) = other:(deVerb rest)
 
 -- | Convert Pandoc block element to LaTeX.
@@ -213,7 +213,8 @@ blockToLaTeX (CodeBlock (_,classes,keyvalAttr) str) = do
                           "]"
   return $ "\\begin{" <> text env <> "}" <> printParams $$ flush (text str) $$
            "\\end{" <> text env <> "}" $$ cr   -- final cr needed because of footnotes
-blockToLaTeX (RawHtml _) = return empty
+blockToLaTeX (RawBlock "latex" x) = return $ text x <> blankline
+blockToLaTeX (RawBlock _ _) = return empty
 blockToLaTeX (BulletList lst) = do
   items <- mapM listItemToLaTeX lst
   return $ "\\begin{itemize}" $$ vcat items $$ "\\end{itemize}"
@@ -359,7 +360,7 @@ inlineToLaTeX (Cite cits lst) = do
      Biblatex -> citationsToBiblatex cits
      _        -> inlineListToLaTeX lst
 
-inlineToLaTeX (Code str) = do
+inlineToLaTeX (Code _ str) = do
   st <- get
   when (stInNote st) $ modify $ \s -> s{ stVerbInNote = True }
   let chr = ((enumFromTo '!' '~') \\ str) !! 0
@@ -391,13 +392,14 @@ inlineToLaTeX Ellipses = return "\\ldots{}"
 inlineToLaTeX (Str str) = return $ text $ stringToLaTeX str
 inlineToLaTeX (Math InlineMath str) = return $ char '$' <> text str <> char '$'
 inlineToLaTeX (Math DisplayMath str) = return $ "\\[" <> text str <> "\\]"
-inlineToLaTeX (TeX str) = return $ text str
-inlineToLaTeX (HtmlInline _) = return empty
+inlineToLaTeX (RawInline "latex" str) = return $ text str
+inlineToLaTeX (RawInline "tex" str) = return $ text str
+inlineToLaTeX (RawInline _ _) = return empty
 inlineToLaTeX (LineBreak) = return "\\\\"
 inlineToLaTeX Space = return space
 inlineToLaTeX (Link txt (src, _)) =
   case txt of
-        [Code x] | x == src ->  -- autolink
+        [Code _ x] | x == src ->  -- autolink
              do modify $ \s -> s{ stUrl = True }
                 return $ text $ "\\url{" ++ x ++ "}"
         _ -> do contents <- inlineListToLaTeX $ deVerb txt

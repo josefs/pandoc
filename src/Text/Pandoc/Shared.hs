@@ -257,7 +257,7 @@ normalizeSpaces = cleanup . dropWhile isSpaceOrEmpty
 -- | Normalize @Pandoc@ document, consolidating doubled 'Space's,
 -- combining adjacent 'Str's and 'Emph's, remove 'Null's and
 -- empty elements, etc.
-normalize :: Pandoc -> Pandoc
+normalize :: Data a => a -> a
 normalize = topDown consolidateInlines .
             bottomUp removeEmptyInlines .
             topDown removeEmptyBlocks
@@ -267,7 +267,7 @@ removeEmptyBlocks (Null : xs) = removeEmptyBlocks xs
 removeEmptyBlocks (BulletList [] : xs) = removeEmptyBlocks xs
 removeEmptyBlocks (OrderedList _ [] : xs) = removeEmptyBlocks xs
 removeEmptyBlocks (DefinitionList [] : xs) = removeEmptyBlocks xs
-removeEmptyBlocks (RawHtml [] : xs) = removeEmptyBlocks xs
+removeEmptyBlocks (RawBlock _ [] : xs) = removeEmptyBlocks xs
 removeEmptyBlocks (x:xs) = x : removeEmptyBlocks xs
 removeEmptyBlocks [] = []
 
@@ -278,9 +278,8 @@ removeEmptyInlines (Subscript [] : zs) = removeEmptyInlines zs
 removeEmptyInlines (Superscript [] : zs) = removeEmptyInlines zs
 removeEmptyInlines (SmallCaps [] : zs) = removeEmptyInlines zs
 removeEmptyInlines (Strikeout [] : zs) = removeEmptyInlines zs
-removeEmptyInlines (TeX [] : zs) = removeEmptyInlines zs
-removeEmptyInlines (HtmlInline [] : zs) = removeEmptyInlines zs
-removeEmptyInlines (Code [] : zs) = removeEmptyInlines zs
+removeEmptyInlines (RawInline _ [] : zs) = removeEmptyInlines zs
+removeEmptyInlines (Code _ [] : zs) = removeEmptyInlines zs
 removeEmptyInlines (x : xs) = x : removeEmptyInlines xs
 removeEmptyInlines [] = []
 
@@ -311,12 +310,10 @@ consolidateInlines (SmallCaps xs : SmallCaps ys : zs) = consolidateInlines $
   SmallCaps (xs ++ ys) : zs
 consolidateInlines (Strikeout xs : Strikeout ys : zs) = consolidateInlines $
   Strikeout (xs ++ ys) : zs
-consolidateInlines (TeX x : TeX y : zs) = consolidateInlines $
-  TeX (x ++ y) : zs
-consolidateInlines (HtmlInline x : HtmlInline y : zs) = consolidateInlines $
-  HtmlInline (x ++ y) : zs
-consolidateInlines (Code x : Code y : zs) = consolidateInlines $
-  Code (x ++ y) : zs
+consolidateInlines (RawInline f x : RawInline f' y : zs) | f == f' =
+  consolidateInlines $ RawInline f (x ++ y) : zs
+consolidateInlines (Code a1 x : Code a2 y : zs) | a1 == a2 =
+  consolidateInlines $ Code a1 (x ++ y) : zs
 consolidateInlines (x : xs) = x : consolidateInlines xs
 consolidateInlines [] = []
 
@@ -326,7 +323,7 @@ stringify = queryWith go
   where go :: Inline -> [Char]
         go Space = " "
         go (Str x) = x
-        go (Code x) = x
+        go (Code _ x) = x
         go (Math _ x) = x
         go EmDash = "--"
         go EnDash = "-"

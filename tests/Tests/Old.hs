@@ -12,6 +12,7 @@ import System.Exit
 import Data.Algorithm.Diff
 import Text.Pandoc.Shared ( substitute, normalize, defaultWriterOptions )
 import Text.Pandoc.Writers.Native ( writeNative )
+import Text.Pandoc.Readers.Native ( readNative )
 import Text.Pandoc.Highlighting ( languages )
 import Prelude hiding ( readFile )
 import qualified Data.ByteString.Lazy as B
@@ -32,8 +33,11 @@ data TestResult = TestPassed
 instance Show TestResult where
   show TestPassed     = "PASSED"
   show (TestError ec) = "ERROR " ++ show ec
-  show (TestFailed cmd file d) = "\n--- " ++ file ++
-                                 "\n+++ " ++ cmd ++ "\n" ++ showDiff (1,1) d
+  show (TestFailed cmd file d) = '\n' : dash ++
+                                 "\n--- " ++ file ++
+                                 "\n+++ " ++ cmd ++ "\n" ++ showDiff (1,1) d ++
+                                 dash
+    where dash = replicate 72 '-'
 
 showDiff :: (Int,Int) -> [(DI, String)] -> String
 showDiff _ []             = ""
@@ -128,7 +132,7 @@ lhsReaderTest :: String -> Test
 lhsReaderTest format =
   testWithNormalize normalizer "lhs" ["-r", format, "-w", "native"]
     ("lhs-test" <.> format) "lhs-test.native"
-   where normalizer = writeNative defaultWriterOptions . normalize . read
+   where normalizer = writeNative defaultWriterOptions . normalize . readNative
 
 latexCitationTests :: String -> Test
 latexCitationTests n

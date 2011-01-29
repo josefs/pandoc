@@ -1,5 +1,5 @@
 Name:            pandoc
-Version:         1.7
+Version:         1.8
 Cabal-Version:   >= 1.6
 Build-Type:      Custom
 License:         GPL
@@ -73,7 +73,12 @@ Extra-Source-Files:
                  man/man1/markdown2pdf.1.md,
                  -- code to create pandoc.1 man page
                  MakeManPage.hs,
-                 manpage.template,
+                 man/man1/pandoc.1.template,
+                 man/man5/pandoc_markdown.5.template,
+                 -- generated man pages (produced post-build)
+                 man/man1/markdown2pdf.1,
+                 man/man1/pandoc.1,
+                 man/man5/pandoc_markdown.5,
                  -- benchmarks
                  Benchmark.hs,
                  -- tests
@@ -153,7 +158,9 @@ Extra-Source-Files:
                  tests/lhs-test.nohl.html,
                  tests/lhs-test.nohl.html+lhs,
                  tests/lhs-test.fragment.html+lhs
-Extra-Tmp-Files: man/man1/pandoc.1, man/man1/markdown2pdf.1
+Extra-Tmp-Files: man/man1/pandoc.1,
+                 man/man1/markdown2pdf.1,
+                 man/man5/pandoc_markdown.5
 
 Flag threaded
   Description:   Compile markdown2pdf with -threaded option.
@@ -199,7 +206,7 @@ Library
                  random >= 1 && < 1.1,
                  extensible-exceptions >= 0.1 && < 0.2,
                  citeproc-hs >= 0.3 && < 0.4,
-                 pandoc-types == 1.7.*,
+                 pandoc-types == 1.8.*,
                  json >= 0.4 && < 0.5,
                  dlist >= 0.4 && < 0.6,
                  tagsoup >= 0.12 && < 0.13
@@ -208,7 +215,7 @@ Library
   else
     Build-depends: base >= 3 && < 4
   if flag(highlighting)
-    Build-depends: highlighting-kate >= 0.2.7.1 && < 0.2.9
+    Build-depends: highlighting-kate >= 0.2.8.2 && < 0.2.9
     cpp-options:   -D_HIGHLIGHTING
   if impl(ghc >= 6.12)
     Ghc-Options:   -O2 -Wall -fno-warn-unused-do-bind
@@ -231,6 +238,7 @@ Library
                    Text.Pandoc.Readers.RST,
                    Text.Pandoc.Readers.TeXMath,
                    Text.Pandoc.Readers.Textile,
+                   Text.Pandoc.Readers.Native,
                    Text.Pandoc.Writers.Native,
                    Text.Pandoc.Writers.Docbook,
                    Text.Pandoc.Writers.HTML,
@@ -282,7 +290,7 @@ Executable pandoc
                  random >= 1 && < 1.1,
                  extensible-exceptions >= 0.1 && < 0.2,
                  citeproc-hs >= 0.3 && < 0.4,
-                 pandoc-types == 1.7.*,
+                 pandoc-types == 1.8.*,
                  json >= 0.4 && < 0.5,
                  dlist >= 0.4 && < 0.6,
                  tagsoup >= 0.12 && < 0.13
@@ -291,7 +299,7 @@ Executable pandoc
   else
     Build-depends: base >= 3 && < 4
   if flag(highlighting)
-    Build-depends: highlighting-kate >= 0.2.7.1 && < 0.2.9
+    Build-depends: highlighting-kate >= 0.2.8.2 && < 0.2.9
     cpp-options:   -D_HIGHLIGHTING
   if impl(ghc >= 6.12)
     Ghc-Options:   -O2 -Wall -fno-warn-unused-do-bind
@@ -326,7 +334,11 @@ Executable test-pandoc
   Hs-Source-Dirs:     tests, src
   Main-Is:            test-pandoc.hs
   if flag(highlighting)
-    cpp-options:   -D_HIGHLIGHTING
+    cpp-options:      -D_HIGHLIGHTING
+  if impl(ghc >= 7)
+    cpp-options:      -D_LIT=lit
+  else
+    cpp-options:      -D_LIT=$lit
   if !flag(tests)
     Buildable:        False
   else
@@ -337,8 +349,16 @@ Executable test-pandoc
     Extensions:       CPP
     Build-Depends:    base >= 4 && < 5, Diff, test-framework >= 0.3 && < 0.4,
                       test-framework-hunit >= 0.2 && < 0.3,
-                      HUnit >= 1.2 && < 1.3
+                      test-framework-quickcheck2 >= 0.2.9 && < 0.3,
+                      QuickCheck >= 2.4 && < 2.6,
+                      HUnit >= 1.2 && < 1.3,
+                      template-haskell >= 2.4 && < 2.6,
+                      ansi-terminal == 0.5.*
     Other-Modules:    Tests.Old
                       Tests.Helpers
                       Tests.Arbitrary
                       Tests.Readers.LaTeX
+                      Tests.Readers.Markdown
+                      Tests.Readers.RST
+                      Tests.Writers.Native
+                      Tests.Writers.ConTeXt

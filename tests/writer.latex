@@ -11,6 +11,8 @@
 }\makeatother
 \usepackage{enumerate}
 \usepackage[normalem]{ulem}
+% avoid problems with \sout in headers with hyperref:
+\pdfstringdefDisableCommands{\renewcommand{\sout}{}}
 \newcommand{\textsubscr}[1]{\ensuremath{_{\scriptsize\textrm{#1}}}}
 \usepackage{url}
 \usepackage{graphicx}

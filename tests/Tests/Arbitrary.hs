@@ -1,4 +1,5 @@
 {-# OPTIONS_GHC -fno-warn-orphans #-}
+{-# LANGUAGE TypeSynonymInstances #-}
 -- provides Arbitrary instance for Pandoc types
 module Tests.Arbitrary ()
 where
@@ -7,12 +8,19 @@ import Test.QuickCheck.Arbitrary
 import Control.Monad (liftM, liftM2)
 import Text.Pandoc
 import Text.Pandoc.Shared
+import Text.Pandoc.Builder
 
 realString :: Gen String
-realString = elements wordlist
+realString = resize 8 arbitrary -- elements wordlist
 
 wordlist :: [String]
 wordlist = ["foo","Bar","baz","\\","/",":","\"","'","féé"]
+
+instance Arbitrary Inlines where
+  arbitrary = liftM fromList arbitrary
+
+instance Arbitrary Blocks where
+  arbitrary = liftM fromList arbitrary
 
 instance Arbitrary Inline where
   arbitrary = resize 3 $ arbInline 3
@@ -22,11 +30,13 @@ instance Arbitrary Inline where
 arbInline :: Int -> Gen Inline
 arbInline n = frequency $ [ (60, liftM Str realString)
                           , (60, return Space)
-                          , (10, liftM Code realString)
+                          , (10, liftM2 Code arbitrary realString)
                           , (5,  return EmDash)
                           , (5,  return EnDash)
                           , (5,  return Apostrophe)
                           , (5,  return Ellipses)
+                          , (5,  elements [ RawInline "html" "<a>*&amp;*</a>"
+                                          , RawInline "latex" "\\my{command}" ])
                           ] ++ [ x | x <- nesters, n > 1]
    where nesters = [ (10,  liftM Emph $ listOf $ arbInline (n-1))
                    , (10,  liftM Strong $ listOf $ arbInline (n-1))
@@ -58,7 +68,11 @@ arbBlock :: Int -> Gen Block
 arbBlock n = frequency $ [ (10, liftM Plain arbitrary)
                          , (15, liftM Para arbitrary)
                          , (5,  liftM2 CodeBlock arbitrary realString)
-                         , (2,  liftM RawHtml realString)
+                         , (2,  elements [ RawBlock "html"
+                                            "<div>\n*&amp;*\n</div>"
+                                         , RawBlock "latex"
+                                            "\\begin[opt]{env}\nhi\n{\\end{env}"
+                                         ])
                          , (5,  do x1 <- choose (1 :: Int, 6)
                                    x2 <- arbitrary
                                    return (Header x1 x2))
@@ -83,10 +97,8 @@ arbBlock n = frequency $ [ (10, liftM Plain arbitrary)
                    ]
 
 instance Arbitrary Pandoc where
-        arbitrary
-          = do x1 <- arbitrary
-               x2 <- arbitrary
-               return $ normalize (Pandoc x1 x2)
+        arbitrary = resize 8 $ liftM normalize
+                             $ liftM2 Pandoc arbitrary arbitrary
 
 {-
 instance Arbitrary CitationMode where

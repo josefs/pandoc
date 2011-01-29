@@ -78,7 +78,7 @@ import Text.Pandoc.Generic
 import qualified Text.Pandoc.UTF8 as UTF8 (putStrLn)
 import Text.ParserCombinators.Parsec
 import Text.Pandoc.CharacterReferences ( characterReference )
-import Data.Char ( toLower, toUpper, ord, isAscii, isAlphaNum )
+import Data.Char ( toLower, toUpper, ord, isAscii, isAlphaNum, isDigit )
 import Data.List ( intercalate, transpose )
 import Network.URI ( parseURI, URI (..), isAllowedInURI )
 import Control.Monad ( join, liftM, guard )
@@ -120,7 +120,7 @@ oneOfStrings listOfStrings = choice $ map (try . string) listOfStrings
 
 -- | Parses a space or tab.
 spaceChar :: CharParser st Char
-spaceChar = char ' ' <|> char '\t'
+spaceChar = satisfy $ \c -> c == ' ' || c == '\t'
 
 -- | Skips zero or more spaces or tabs.
 skipSpaces :: GenParser Char st ()
@@ -175,7 +175,8 @@ lineClump = blanklines
 charsInBalanced :: Char -> Char -> GenParser Char st String
 charsInBalanced open close = try $ do
   char open
-  raw <- many $     (many1 (noneOf [open, close, '\n']))
+  raw <- many $     (many1 (satisfy $ \c ->
+                             c /= open && c /= close && c /= '\n'))
                 <|> (do res <- charsInBalanced open close
                         return $ [open] ++ res ++ [close])
                 <|> try (string "\n" >>~ notFollowedBy' blanklines)
@@ -186,7 +187,7 @@ charsInBalanced open close = try $ do
 charsInBalanced' :: Char -> Char -> GenParser Char st String
 charsInBalanced' open close = try $ do
   char open
-  raw <- many $       (many1 (noneOf [open, close]))
+  raw <- many $       (many1 (satisfy $ \c -> c /= open && c /= close))
                   <|> (do res <- charsInBalanced' open close
                           return $ [open] ++ res ++ [close])
   char close
@@ -207,7 +208,7 @@ romanNumeral upperCase = do
     let romanDigits = if upperCase 
                          then uppercaseRomanDigits 
                          else lowercaseRomanDigits
-    lookAhead $ oneOf romanDigits 
+    lookAhead $ oneOf romanDigits
     let [one, five, ten, fifty, hundred, fivehundred, thousand] = 
           map char romanDigits
     thousands <- many thousand >>= (return . (1000 *) . length)
@@ -233,7 +234,8 @@ romanNumeral upperCase = do
 -- Parsers for email addresses and URIs
 
 emailChar :: GenParser Char st Char
-emailChar = alphaNum <|> oneOf "-+_."
+emailChar = alphaNum <|>
+            satisfy (\c -> c == '-' || c == '+' || c == '_' || c == '.')
 
 domainChar :: GenParser Char st Char
 domainChar = alphaNum <|> char '-'
@@ -333,7 +335,7 @@ decimal = do
 exampleNum :: GenParser Char ParserState (ListNumberStyle, Int)
 exampleNum = do
   char '@'
-  lab <- many (alphaNum <|> oneOf "_-")
+  lab <- many (alphaNum <|> satisfy (\c -> c == '_' || c == '-'))
   st <- getState
   let num = stateNextExample st
   let newlabels = if null lab
@@ -660,13 +662,12 @@ newtype Key = Key [Inline] deriving (Show, Read, Eq, Ord)
 toKey :: [Inline] -> Key
 toKey = Key . bottomUp lowercase
   where lowercase :: Inline -> Inline
-        lowercase (Str xs)        = Str (map toLower xs)
-        lowercase (Math t xs)     = Math t (map toLower xs)
-        lowercase (Code xs)       = Code (map toLower xs)
-        lowercase (TeX xs)        = TeX (map toLower xs)
-        lowercase (HtmlInline xs) = HtmlInline (map toLower xs)
-        lowercase LineBreak       = Space
-        lowercase x               = x
+        lowercase (Str xs)          = Str (map toLower xs)
+        lowercase (Math t xs)       = Math t (map toLower xs)
+        lowercase (Code attr xs)    = Code attr (map toLower xs)
+        lowercase (RawInline f xs)  = RawInline f (map toLower xs)
+        lowercase LineBreak         = Space
+        lowercase x                 = x
 
 fromKey :: Key -> [Inline]
 fromKey (Key xs) = xs
@@ -757,7 +758,7 @@ doubleQuoteStart :: GenParser Char ParserState ()
 doubleQuoteStart = do
   failIfInQuoteContext InDoubleQuote
   try $ do charOrRef "\"\8220"
-           notFollowedBy (oneOf " \t\n")
+           notFollowedBy (satisfy (\c -> c == ' ' || c == '\t' || c == '\n'))
 
 doubleQuoteEnd :: GenParser Char st ()
 doubleQuoteEnd = do
@@ -775,12 +776,12 @@ dash = enDash <|> emDash
 enDash :: GenParser Char st Inline
 enDash = do
   try (charOrRef "–") <|>
-    try (char '-' >> notFollowedBy (noneOf "0123456789") >> return '–')
+    try (char '-' >> lookAhead (satisfy isDigit) >> return '–')
   return EnDash
 
 emDash :: GenParser Char st Inline
 emDash = do
-  try (charOrRef "—") <|> (oneOfStrings ["---", "--"] >> return '—')
+  try (charOrRef "—") <|> (try $ string "--" >> optional (char '-') >> return '—')
   return EmDash
 
 --

@@ -169,7 +169,7 @@ pRawHtmlBlock = do
   raw <- pHtmlBlock "script" <|> pHtmlBlock "style" <|> pRawTag
   state <- getState
   if stateParseRaw state && not (null raw)
-     then return [RawHtml raw]
+     then return [RawBlock "html" raw]
      else return []
 
 pHtmlBlock :: String -> TagParser String
@@ -338,16 +338,20 @@ pImage = do
 
 pCode :: TagParser [Inline]
 pCode = try $ do
-  (TagOpen open _) <- pSatisfy $ tagOpen (`elem` ["code","tt"]) (const True)
+  (TagOpen open attr) <- pSatisfy $ tagOpen (`elem` ["code","tt"]) (const True)
   result <- manyTill pAnyTag (pCloses open)
-  return [Code $ intercalate " " $ lines $ innerText result]
+  let ident = fromMaybe "" $ lookup "id" attr
+  let classes = words $ fromMaybe [] $ lookup "class" attr
+  let rest = filter (\(x,_) -> x /= "id" && x /= "class") attr
+  return [Code (ident,classes,rest)
+         $ intercalate " " $ lines $ innerText result]
 
 pRawHtmlInline :: TagParser [Inline]
 pRawHtmlInline = do
   result <- pSatisfy (tagComment (const True)) <|> pSatisfy isInlineTag
   state <- getState
   if stateParseRaw state
-     then return [HtmlInline $ renderTags' [result]]
+     then return [RawInline "html" $ renderTags' [result]]
      else return []
 
 pInlinesInTags :: String -> ([Inline] -> Inline)

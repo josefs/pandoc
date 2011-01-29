@@ -448,7 +448,7 @@ rawLaTeXEnvironment :: GenParser Char st Block
 rawLaTeXEnvironment = do
   contents <- rawLaTeXEnvironment'
   spaces
-  return $ Para [TeX contents]
+  return $ RawBlock "latex" contents
 
 -- | Parse any LaTeX environment and return a string containing
 -- the whole literal environment as raw TeX.
@@ -491,7 +491,7 @@ demacro (n,st,args) = try $ do
   let raw = "\\" ++ n ++ st ++ concat args
   s' <- applyMacros' raw
   if raw == s'
-     then return $ TeX raw
+     then return $ RawInline "latex" raw
      else do
        inp <- getInput
        setInput $ s' ++ inp
@@ -710,27 +710,27 @@ code1 = try $ do
   string "\\verb"
   marker <- anyChar
   result <- manyTill anyChar (char marker)
-  return $ Code $ removeLeadingTrailingSpace result
+  return $ Code nullAttr $ removeLeadingTrailingSpace result
 
 code2 :: GenParser Char st Inline
 code2 = try $ do
   string "\\texttt{"
   result <- manyTill (noneOf "\\\n~$%^&{}") (char '}')
-  return $ Code result
+  return $ Code nullAttr result
 
 code3 :: GenParser Char st Inline
 code3 = try $ do 
   string "\\lstinline"
   marker <- anyChar
   result <- manyTill anyChar (char marker)
-  return $ Code $ removeLeadingTrailingSpace result
+  return $ Code nullAttr $ removeLeadingTrailingSpace result
 
 lhsInlineCode :: GenParser Char ParserState Inline
 lhsInlineCode = try $ do
   failUnlessLHS
   char '|'
   result <- manyTill (noneOf "|\n") (char '|')
-  return $ Code result
+  return $ Code ("",["haskell"],[]) result
 
 emph :: GenParser Char ParserState Inline
 emph = try $ oneOfStrings [ "\\emph{", "\\textit{" ] >>
@@ -861,7 +861,7 @@ url :: GenParser Char ParserState Inline
 url = try $ do
   string "\\url"
   url' <- charsInBalanced '{' '}'
-  return $ Link [Code url'] (escapeURI url', "")
+  return $ Link [Code ("",["url"],[]) url'] (escapeURI url', "")
 
 link :: GenParser Char ParserState Inline
 link = try $ do
@@ -930,7 +930,9 @@ simpleCite = try $ do
       mintext      = ["textcites"]
       mnormal      = map (++ "s") biblatex
       cmdend       = notFollowedBy (letter <|> char '*')
-      addUpper xs  = xs ++ map (\(c:cs) -> toUpper c : cs) xs
+      capit []     = []
+      capit (x:xs) = toUpper x : xs
+      addUpper xs  = xs ++ map capit xs
       toparser l t = try $ oneOfStrings (addUpper l) >> cmdend >> return t
   (mode, multi) <-  toparser normal  (NormalCitation, False)
                 <|> toparser supress (SuppressAuthor, False)

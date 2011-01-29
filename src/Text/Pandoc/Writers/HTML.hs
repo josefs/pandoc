@@ -105,8 +105,8 @@ pandocToHtml opts (Pandoc (Meta title' authors' date') blocks) = do
   toc <- if writerTableOfContents opts 
             then tableOfContents opts sects
             else return Nothing
-  let startSlide = RawHtml "<div class=\"slide\">\n"
-      endSlide   = RawHtml "</div>\n"
+  let startSlide = RawBlock "html" "<div class=\"slide\">\n"
+      endSlide   = RawBlock "html" "</div>\n"
   let cutUp (HorizontalRule : Header 1 ys : xs) = cutUp (Header 1 ys : xs)
       cutUp (HorizontalRule : xs) = [endSlide, startSlide] ++ cutUp xs
       cutUp (Header 1 ys : xs)    = [endSlide, startSlide] ++
@@ -298,6 +298,12 @@ obfuscateChar char =
 obfuscateString :: String -> String
 obfuscateString = concatMap obfuscateChar . decodeCharacterReferences
 
+attrsToHtml :: WriterOptions -> Attr -> [HtmlAttr]
+attrsToHtml opts (id',classes',keyvals) =
+  [theclass (unwords classes') | not (null classes')] ++
+  [prefixedId opts id' | not (null id')] ++
+  map (\(x,y) -> strAttr x y) keyvals
+
 -- | Convert Pandoc block element to HTML.
 blockToHtml :: WriterOptions -> Block -> State WriterState Html
 blockToHtml _ Null = return $ noHtml 
@@ -311,7 +317,8 @@ blockToHtml opts (Para [Image txt (s,tit)]) = do
               else thediv ! [theclass "figure"] <<
                     [img, paragraph ! [theclass "caption"] << capt]
 blockToHtml opts (Para lst) = inlineListToHtml opts lst >>= (return . paragraph)
-blockToHtml _ (RawHtml str) = return $ primHtml str
+blockToHtml _ (RawBlock "html" str) = return $ primHtml str
+blockToHtml _ (RawBlock _ _) = return noHtml
 blockToHtml _ (HorizontalRule) = return $ hr
 blockToHtml opts (CodeBlock (id',classes,keyvals) rawCode) = do
   let classes' = if writerLiterateHaskell opts
@@ -321,9 +328,7 @@ blockToHtml opts (CodeBlock (id',classes,keyvals) rawCode) = do
          Left _  -> -- change leading newlines into <br /> tags, because some
                     -- browsers ignore leading newlines in pre blocks
                     let (leadingBreaks, rawCode') = span (=='\n') rawCode
-                        attrs = [theclass (unwords classes') | not (null classes')] ++
-                                [prefixedId opts id' | not (null id')] ++
-                                map (\(x,y) -> strAttr x y) keyvals
+                        attrs = attrsToHtml opts (id', classes', keyvals)
                         addBird = if "literate" `elem` classes'
                                      then unlines . map ("> " ++) . lines
                                      else unlines . lines
@@ -478,7 +483,10 @@ inlineToHtml opts inline =
     (Apostrophe)     -> return $ stringToHtml "’"
     (Emph lst)       -> inlineListToHtml opts lst >>= return . emphasize
     (Strong lst)     -> inlineListToHtml opts lst >>= return . strong
-    (Code str)       -> return $ thecode << str
+    (Code attr str)  -> return $ thecode ! (attrsToHtml opts attr) << str'
+                         where str' = case highlightHtml attr str of
+                                Left _  -> stringToHtml str
+                                Right h -> h
     (Strikeout lst)  -> inlineListToHtml opts lst >>=
                         return . (thespan ! [thestyle "text-decoration: line-through;"])
     (SmallCaps lst)   -> inlineListToHtml opts lst >>=
@@ -540,12 +548,13 @@ inlineToHtml opts inline =
                                   return  $ case t of
                                              InlineMath  -> m
                                              DisplayMath -> br +++ m +++ br )
-    (TeX str)        -> case writerHTMLMathMethod opts of
-                              LaTeXMathML _ -> do modify (\st -> st {stMath = True})
-                                                  return $ primHtml str
-                              _             -> return noHtml
-    (HtmlInline str) -> return $ primHtml str 
-    (Link [Code str] (s,_)) | "mailto:" `isPrefixOf` s ->
+    (RawInline "latex" str) -> case writerHTMLMathMethod opts of
+                               LaTeXMathML _ -> do modify (\st -> st {stMath = True})
+                                                   return $ primHtml str
+                               _             -> return noHtml
+    (RawInline "html" str) -> return $ primHtml str 
+    (RawInline _ _) -> return noHtml
+    (Link [Code _ str] (s,_)) | "mailto:" `isPrefixOf` s ->
                         return $ obfuscateLink opts str s
     (Link txt (s,_)) | "mailto:" `isPrefixOf` s -> do
                         linkText <- inlineListToHtml opts txt  
@@ -585,7 +594,7 @@ blockListToNote :: WriterOptions -> String -> [Block] -> State WriterState Html
 blockListToNote opts ref blocks =
   -- If last block is Para or Plain, include the backlink at the end of
   -- that block. Otherwise, insert a new Plain block with the backlink.
-  let backlink = [HtmlInline $ " <a href=\"#" ++ writerIdentifierPrefix opts ++ "fnref" ++ ref ++ 
+  let backlink = [RawInline "html" $ " <a href=\"#" ++ writerIdentifierPrefix opts ++ "fnref" ++ ref ++ 
                  "\" class=\"footnoteBackLink\"" ++
                  " title=\"Jump back to footnote " ++ ref ++ "\">↩</a>"]
       blocks'  = if null blocks

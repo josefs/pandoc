@@ -179,7 +179,10 @@ blockToDocbook opts (OrderedList (start, numstyle, _) (first:rest)) =
   in  inTags True "orderedlist" attribs items
 blockToDocbook opts (DefinitionList lst) = 
   inTagsIndented "variablelist" $ deflistItemsToDocbook opts lst 
-blockToDocbook _ (RawHtml str) = text str -- raw XML block 
+blockToDocbook _ (RawBlock "docbook" str) = text str -- raw XML block 
+-- we allow html for compatibility with earlier versions of pandoc
+blockToDocbook _ (RawBlock "html" str) = text str -- raw XML block
+blockToDocbook _ (RawBlock _ _) = empty
 blockToDocbook _ HorizontalRule = empty -- not semantic
 blockToDocbook opts (Table caption aligns widths headers rows) =
   let alignStrings = map alignmentToString aligns
@@ -255,11 +258,10 @@ inlineToDocbook _ Apostrophe = char '\''
 inlineToDocbook _ Ellipses = text "…"
 inlineToDocbook _ EmDash = text "—"
 inlineToDocbook _ EnDash = text "–"
-inlineToDocbook _ (Code str) = 
+inlineToDocbook _ (Code _ str) = 
   inTagsSimple "literal" $ text (escapeStringForXML str)
 inlineToDocbook opts (Math _ str) = inlinesToDocbook opts $ readTeXMath str
-inlineToDocbook _ (TeX _) = empty
-inlineToDocbook _ (HtmlInline _) = empty
+inlineToDocbook _ (RawInline _ _) = empty
 inlineToDocbook _ LineBreak = inTagsSimple "literallayout" empty
 inlineToDocbook _ Space = space
 inlineToDocbook opts (Link txt (src, _)) =
@@ -267,10 +269,10 @@ inlineToDocbook opts (Link txt (src, _)) =
      then let src' = drop 7 src
               emailLink = inTagsSimple "email" $ text $ 
                           escapeStringForXML $ src'
-          in  if txt == [Code src']
-                 then emailLink
-                 else inlinesToDocbook opts txt <+> char '(' <> emailLink <> 
-                      char ')'
+          in  case txt of
+               [Code _ s] | s == src' -> emailLink
+               _             -> inlinesToDocbook opts txt <+>
+                                  char '(' <> emailLink <> char ')'
      else (if isPrefixOf "#" src
               then inTags False "link" [("linkend", drop 1 src)]
               else inTags False "ulink" [("url", src)]) $
