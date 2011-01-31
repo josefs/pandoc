@@ -324,7 +324,7 @@ blockToHtml opts (CodeBlock (id',classes,keyvals) rawCode) = do
   let classes' = if writerLiterateHaskell opts
                     then classes
                     else filter (/= "literate") classes
-  case highlightHtml (id',classes',keyvals) rawCode of
+  case highlightHtml False (id',classes',keyvals) rawCode of
          Left _  -> -- change leading newlines into <br /> tags, because some
                     -- browsers ignore leading newlines in pre blocks
                     let (leadingBreaks, rawCode') = span (=='\n') rawCode
@@ -483,10 +483,11 @@ inlineToHtml opts inline =
     (Apostrophe)     -> return $ stringToHtml "’"
     (Emph lst)       -> inlineListToHtml opts lst >>= return . emphasize
     (Strong lst)     -> inlineListToHtml opts lst >>= return . strong
-    (Code attr str)  -> return $ thecode ! (attrsToHtml opts attr) << str'
-                         where str' = case highlightHtml attr str of
-                                Left _  -> stringToHtml str
-                                Right h -> h
+    (Code attr str)  -> case highlightHtml True attr str of
+                             Left _  -> return
+                                        $ thecode ! (attrsToHtml opts attr)
+                                        $ stringToHtml str
+                             Right h -> return h
     (Strikeout lst)  -> inlineListToHtml opts lst >>=
                         return . (thespan ! [thestyle "text-decoration: line-through;"])
     (SmallCaps lst)   -> inlineListToHtml opts lst >>=
