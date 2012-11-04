@@ -1,5 +1,6 @@
+{-# LANGUAGE CPP #-}
 {-
-Copyright (C) 2006-2010 John MacFarlane <jgm@berkeley.edu>
+Copyright (C) 2006-2012 John MacFarlane <jgm@berkeley.edu>
 
 This program is free software; you can redistribute it and/or modify
 it under the terms of the GNU General Public License as published by
@@ -18,7 +19,7 @@ Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
 
 {- |
    Module      : Main
-   Copyright   : Copyright (C) 2006-2010 John MacFarlane
+   Copyright   : Copyright (C) 2006-2012 John MacFarlane
    License     : GNU GPL, version 2 or above
 
    Maintainer  : John MacFarlane <jgm@berkeley@edu>
@@ -30,58 +31,59 @@ writers.
 -}
 module Main where
 import Text.Pandoc
-import Text.Pandoc.S5 (s5HeaderIncludes)
-import Text.Pandoc.Shared ( tabFilter, ObfuscationMethod (..), readDataFile,
-                            headerShift, findDataFile, normalize )
-#ifdef _HIGHLIGHTING
-import Text.Pandoc.Highlighting ( languages )
-#endif
+import Text.Pandoc.PDF (tex2pdf)
+import Text.Pandoc.Readers.LaTeX (handleIncludes)
+import Text.Pandoc.Shared ( tabFilter, readDataFile, safeRead,
+                            headerShift, normalize, err, warn )
+import Text.Pandoc.XML ( toEntities, fromEntities )
+import Text.Pandoc.SelfContained ( makeSelfContained )
+import Text.Pandoc.Highlighting ( languages, Style, tango, pygments,
+         espresso, zenburn, kate, haddock, monochrome )
 import System.Environment ( getArgs, getProgName )
 import System.Exit ( exitWith, ExitCode (..) )
 import System.FilePath
 import System.Console.GetOpt
 import Data.Char ( toLower )
-import Data.List ( intercalate, isSuffixOf, isPrefixOf )
-import System.Directory ( getAppUserDataDirectory, doesFileExist )
-import System.IO ( stdout, stderr )
+import Data.List ( intercalate, isPrefixOf )
+import System.Directory ( getAppUserDataDirectory, doesFileExist, findExecutable )
+import System.IO ( stdout )
+import System.IO.Error ( isDoesNotExistError )
+import qualified Control.Exception as E
+import Control.Exception.Extensible ( throwIO )
 import qualified Text.Pandoc.UTF8 as UTF8
-import Text.CSL
-import Text.Pandoc.Biblio
+import qualified Text.CSL as CSL
 import Control.Monad (when, unless, liftM)
 import Network.HTTP (simpleHTTP, mkRequest, getResponseBody, RequestMethod(..))
 import Network.URI (parseURI, isURI, URI(..))
 import qualified Data.ByteString.Lazy as B
-import Data.ByteString.Lazy.UTF8 (toString )
-import Codec.Binary.UTF8.String (decodeString, encodeString)
+import Text.CSL.Reference (Reference(..))
 
 copyrightMessage :: String
-copyrightMessage = "\nCopyright (C) 2006-2010 John MacFarlane\n" ++
+copyrightMessage = "\nCopyright (C) 2006-2012 John MacFarlane\n" ++
                     "Web:  http://johnmacfarlane.net/pandoc\n" ++
                     "This is free software; see the source for copying conditions.  There is no\n" ++
                     "warranty, not even for merchantability or fitness for a particular purpose."
 
 compileInfo :: String
 compileInfo =
-  "\nCompiled with citeproc support." ++
-#ifdef _HIGHLIGHTING
-   "\nCompiled with syntax highlighting support for:\n" ++
-       wrapWords 78 languages ++
-#endif
-   ""
+  "\nCompiled with citeproc-hs " ++ VERSION_citeproc_hs ++ ", texmath " ++
+  VERSION_texmath ++ ", highlighting-kate " ++ VERSION_highlighting_kate ++
+   ".\nSyntax highlighting is supported for the following languages:\n    " ++
+       wrapWords 4 78 languages
 
 -- | Converts a list of strings into a single string with the items printed as
 -- comma separated words in lines with a maximum line length.
-wrapWords :: Int -> [String] -> String
-wrapWords c = wrap' c c where
-              wrap' _    _         []     = ""
+wrapWords :: Int -> Int -> [String] -> String
+wrapWords indent c = wrap' (c - indent) (c - indent)
+        where wrap' _    _         []     = ""
               wrap' cols remaining (x:xs) = if remaining == cols
                                                then x ++ wrap' cols (remaining - length x) xs
                                                else if (length x + 1) > remaining
-                                                       then ",\n" ++ x ++ wrap' cols (cols - length x) xs
+                                                       then ",\n" ++ replicate indent ' ' ++ x ++ wrap' cols (cols - length x) xs
                                                        else ", "  ++ x ++ wrap' cols (remaining - (length x + 2)) xs
 
-isNonTextOutput :: String -> Bool
-isNonTextOutput = (`elem` ["odt","epub"])
+isTextFormat :: String -> Bool
+isTextFormat s = takeWhile (`notElem` "+-") s `notElem` ["odt","docx","epub","epub3"]
 
 -- | Data structure for command line options.
 data Opt = Opt
@@ -93,24 +95,27 @@ data Opt = Opt
     , optParseRaw          :: Bool    -- ^ Parse unconvertable HTML and TeX
     , optTableOfContents   :: Bool    -- ^ Include table of contents
     , optTransforms        :: [Pandoc -> Pandoc]  -- ^ Doc transforms to apply
-    , optTemplate          :: String  -- ^ Custom template
+    , optTemplate          :: Maybe FilePath  -- ^ Custom template
     , optVariables         :: [(String,String)] -- ^ Template variables to set
     , optOutputFile        :: String  -- ^ Name of output file
     , optNumberSections    :: Bool    -- ^ Number sections in LaTeX
     , optSectionDivs       :: Bool    -- ^ Put sections in div tags in HTML
-    , optIncremental       :: Bool    -- ^ Use incremental lists in Slidy/S5
-    , optOffline           :: Bool    -- ^ Make slideshow accessible offline
-    , optXeTeX             :: Bool    -- ^ Format latex for xetex
+    , optIncremental       :: Bool    -- ^ Use incremental lists in Slidy/Slideous/S5
+    , optSelfContained     :: Bool    -- ^ Make HTML accessible offline
     , optSmart             :: Bool    -- ^ Use smart typography
+    , optOldDashes         :: Bool    -- ^ Parse dashes like pandoc <=1.8.2.1
     , optHtml5             :: Bool    -- ^ Produce HTML5 in HTML
+    , optHighlight         :: Bool    -- ^ Highlight source code
+    , optHighlightStyle    :: Style   -- ^ Style to use for highlighted code
     , optChapters          :: Bool    -- ^ Use chapter for top-level sects
     , optHTMLMathMethod    :: HTMLMathMethod -- ^ Method to print HTML math
     , optReferenceODT      :: Maybe FilePath -- ^ Path of reference.odt
+    , optReferenceDocx     :: Maybe FilePath -- ^ Path of reference.docx
     , optEPUBStylesheet    :: Maybe String   -- ^ EPUB stylesheet
     , optEPUBMetadata      :: String  -- ^ EPUB metadata
+    , optEPUBFonts         :: [FilePath] -- ^ EPUB fonts to embed
     , optDumpArgs          :: Bool    -- ^ Output command-line arguments
     , optIgnoreArgs        :: Bool    -- ^ Ignore command-line arguments
-    , optStrict            :: Bool    -- ^ Use strict markdown syntax
     , optReferenceLinks    :: Bool    -- ^ Use reference links in writing markdown, rst
     , optWrapText          :: Bool    -- ^ Wrap text
     , optColumns           :: Int     -- ^ Line length in characters
@@ -121,8 +126,14 @@ data Opt = Opt
     , optDataDir           :: Maybe FilePath
     , optCiteMethod        :: CiteMethod -- ^ Method to output cites
     , optBibliography      :: [String]
-    , optCslFile           :: FilePath
+    , optCslFile           :: Maybe FilePath
+    , optAbbrevsFile       :: Maybe FilePath
     , optListings          :: Bool       -- ^ Use listings package for code blocks
+    , optLaTeXEngine       :: String     -- ^ Program to use for latex -> pdf
+    , optSlideLevel        :: Maybe Int  -- ^ Header level that creates slides
+    , optSetextHeaders     :: Bool       -- ^ Use atx headers for markdown level 1-2
+    , optAscii             :: Bool       -- ^ Use ascii characters only in html
+    , optTeXLigatures      :: Bool       -- ^ Use TeX ligatures for quotes/dashes
     }
 
 -- | Defaults for command-line options.
@@ -136,24 +147,27 @@ defaultOpts = Opt
     , optParseRaw          = False
     , optTableOfContents   = False
     , optTransforms        = []
-    , optTemplate          = ""
+    , optTemplate          = Nothing
     , optVariables         = []
     , optOutputFile        = "-"    -- "-" means stdout
     , optNumberSections    = False
     , optSectionDivs       = False
     , optIncremental       = False
-    , optOffline           = False
-    , optXeTeX             = False
+    , optSelfContained     = False
     , optSmart             = False
+    , optOldDashes         = False
     , optHtml5             = False
+    , optHighlight         = True
+    , optHighlightStyle    = pygments
     , optChapters          = False
     , optHTMLMathMethod    = PlainMath
     , optReferenceODT      = Nothing
+    , optReferenceDocx     = Nothing
     , optEPUBStylesheet    = Nothing
     , optEPUBMetadata      = ""
+    , optEPUBFonts         = []
     , optDumpArgs          = False
     , optIgnoreArgs        = False
-    , optStrict            = False
     , optReferenceLinks    = False
     , optWrapText          = True
     , optColumns           = 72
@@ -164,8 +178,14 @@ defaultOpts = Opt
     , optDataDir           = Nothing
     , optCiteMethod        = Citeproc
     , optBibliography      = []
-    , optCslFile           = ""
+    , optCslFile           = Nothing
+    , optAbbrevsFile       = Nothing
     , optListings          = False
+    , optLaTeXEngine       = "pdflatex"
+    , optSlideLevel        = Nothing
+    , optSetextHeaders     = True
+    , optAscii             = False
+    , optTeXLigatures      = True
     }
 
 -- | A list of functions, each transforming the options data structure
@@ -184,49 +204,25 @@ options =
                   "FORMAT")
                  ""
 
-    , Option "s" ["standalone"]
-                 (NoArg
-                  (\opt -> return opt { optStandalone = True }))
-                 "" -- "Include needed header and footer on output"
-
     , Option "o" ["output"]
                  (ReqArg
                   (\arg opt -> return opt { optOutputFile = arg })
                   "FILENAME")
                  "" -- "Name of output file"
 
-    , Option "p" ["preserve-tabs"]
-                 (NoArg
-                  (\opt -> return opt { optPreserveTabs = True }))
-                 "" -- "Preserve tabs instead of converting to spaces"
-
-    , Option "" ["tab-stop"]
+    , Option "" ["data-dir"]
                  (ReqArg
-                  (\arg opt ->
-                      case reads arg of
-                           [(t,"")] | t > 0 -> return opt { optTabStop = t }
-                           _          -> do
-                               UTF8.hPutStrLn stderr $
-                                   "tab-stop must be a number greater than 0"
-                               exitWith $ ExitFailure 31)
-                  "NUMBER")
-                 "" -- "Tab stop (default 4)"
+                  (\arg opt -> return opt { optDataDir = Just arg })
+                 "DIRECTORY") -- "Directory containing pandoc data files."
+                ""
 
     , Option "" ["strict"]
                  (NoArg
-                  (\opt -> return opt { optStrict = True } ))
+                  (\opt -> do
+                      err 59 $ "The --strict option has been removed.\n" ++
+                               "Use `markdown_strict' input or output format instead."
+                      return opt ))
                  "" -- "Disable markdown syntax extensions"
-
-    , Option "" ["normalize"]
-                 (NoArg
-                  (\opt -> return opt { optTransforms =
-                                   normalize : optTransforms opt } ))
-                 "" -- "Normalize the Pandoc AST"
-
-    , Option "" ["reference-links"]
-                 (NoArg
-                  (\opt -> return opt { optReferenceLinks = True } ))
-                 "" -- "Use reference links in parsing HTML"
 
     , Option "R" ["parse-raw"]
                  (NoArg
@@ -238,10 +234,363 @@ options =
                   (\opt -> return opt { optSmart = True }))
                  "" -- "Use smart quotes, dashes, and ellipses"
 
+    , Option "" ["old-dashes"]
+                 (NoArg
+                  (\opt -> return opt { optSmart = True
+                                      , optOldDashes = True }))
+                 "" -- "Use smart quotes, dashes, and ellipses"
+
+    , Option "" ["base-header-level"]
+                 (ReqArg
+                  (\arg opt ->
+                      case safeRead arg of
+                           Just t | t > 0 -> do
+                               let oldTransforms = optTransforms opt
+                               let shift = t - 1
+                               return opt{ optTransforms =
+                                           headerShift shift : oldTransforms }
+                           _              -> err 19
+                                       "base-header-level must be a number > 0")
+                  "NUMBER")
+                 "" -- "Headers base level"
+
+     , Option "" ["indented-code-classes"]
+                  (ReqArg
+                   (\arg opt -> return opt { optIndentedCodeClasses = words $
+                                             map (\c -> if c == ',' then ' ' else c) arg })
+                   "STRING")
+                  "" -- "Classes (whitespace- or comma-separated) to use for indented code-blocks"
+
+    , Option "" ["normalize"]
+                 (NoArg
+                  (\opt -> return opt { optTransforms =
+                                   normalize : optTransforms opt } ))
+                 "" -- "Normalize the Pandoc AST"
+
+    , Option "p" ["preserve-tabs"]
+                 (NoArg
+                  (\opt -> return opt { optPreserveTabs = True }))
+                 "" -- "Preserve tabs instead of converting to spaces"
+
+    , Option "" ["tab-stop"]
+                 (ReqArg
+                  (\arg opt ->
+                      case safeRead arg of
+                           Just t | t > 0 -> return opt { optTabStop = t }
+                           _              -> err 31
+                                          "tab-stop must be a number greater than 0")
+                  "NUMBER")
+                 "" -- "Tab stop (default 4)"
+
+    , Option "s" ["standalone"]
+                 (NoArg
+                  (\opt -> return opt { optStandalone = True }))
+                 "" -- "Include needed header and footer on output"
+
+    , Option "" ["template"]
+                 (ReqArg
+                  (\arg opt -> do
+                     return opt{ optTemplate = Just arg,
+                                 optStandalone = True })
+                  "FILENAME")
+                 "" -- "Use custom template"
+
+    , Option "V" ["variable"]
+                 (ReqArg
+                  (\arg opt -> do
+                     let (key,val) = case break (`elem` ":=") arg of
+                                       (k,_:v) -> (k,v)
+                                       (k,_)   -> (k,"true")
+                     return opt{ optVariables = (key,val) : optVariables opt })
+                  "KEY[:VALUE]")
+                 "" -- "Use custom template"
+
+    , Option "D" ["print-default-template"]
+                 (ReqArg
+                  (\arg _ -> do
+                     templ <- getDefaultTemplate Nothing arg
+                     case templ of
+                          Right t -> UTF8.hPutStr stdout t
+                          Left e  -> error $ show e
+                     exitWith ExitSuccess)
+                  "FORMAT")
+                 "" -- "Print default template for FORMAT"
+
+    , Option "" ["no-wrap"]
+                 (NoArg
+                  (\opt -> return opt { optWrapText = False }))
+                 "" -- "Do not wrap text in output"
+
+    , Option "" ["columns"]
+                 (ReqArg
+                  (\arg opt ->
+                      case safeRead arg of
+                           Just t | t > 0 -> return opt { optColumns = t }
+                           _              -> err 33 $
+                                   "columns must be a number greater than 0")
+                 "NUMBER")
+                 "" -- "Length of line in characters"
+
+    , Option "" ["toc", "table-of-contents"]
+                (NoArg
+                 (\opt -> return opt { optTableOfContents = True }))
+               "" -- "Include table of contents"
+
+    , Option "" ["no-highlight"]
+                (NoArg
+                 (\opt -> return opt { optHighlight = False }))
+                 "" -- "Don't highlight source code"
+
+    , Option "" ["highlight-style"]
+                (ReqArg
+                 (\arg opt -> do
+                   newStyle <- case map toLower arg of
+                                     "pygments"   -> return pygments
+                                     "tango"      -> return tango
+                                     "espresso"   -> return espresso
+                                     "zenburn"    -> return zenburn
+                                     "kate"       -> return kate
+                                     "monochrome" -> return monochrome
+                                     "haddock"    -> return haddock
+                                     _            -> err 39 $
+                                         "Unknown style :" ++ arg
+                   return opt{ optHighlightStyle = newStyle })
+                 "STYLE")
+                 "" -- "Style for highlighted code"
+
+    , Option "H" ["include-in-header"]
+                 (ReqArg
+                  (\arg opt -> do
+                     text <- UTF8.readFile arg
+                     -- add new ones to end, so they're included in order specified
+                     let newvars = optVariables opt ++ [("header-includes",text)]
+                     return opt { optVariables = newvars,
+                                  optStandalone = True })
+                  "FILENAME")
+                 "" -- "File to include at end of header (implies -s)"
+
+    , Option "B" ["include-before-body"]
+                 (ReqArg
+                  (\arg opt -> do
+                     text <- UTF8.readFile arg
+                     -- add new ones to end, so they're included in order specified
+                     let newvars = optVariables opt ++ [("include-before",text)]
+                     return opt { optVariables = newvars,
+                                  optStandalone = True })
+                  "FILENAME")
+                 "" -- "File to include before document body"
+
+    , Option "A" ["include-after-body"]
+                 (ReqArg
+                  (\arg opt -> do
+                     text <- UTF8.readFile arg
+                     -- add new ones to end, so they're included in order specified
+                     let newvars = optVariables opt ++ [("include-after",text)]
+                     return opt { optVariables = newvars,
+                                  optStandalone = True })
+                  "FILENAME")
+                 "" -- "File to include after document body"
+
+    , Option "" ["self-contained"]
+                 (NoArg
+                  (\opt -> return opt { optSelfContained = True,
+                                        optVariables = ("slidy-url","slidy") :
+                                                       optVariables opt,
+                                        optStandalone = True }))
+                 "" -- "Make slide shows include all the needed js and css"
+
+    , Option "" ["offline"]
+                 (NoArg
+                  (\opt -> do warn $ "--offline is deprecated. Use --self-contained instead."
+                              return opt { optSelfContained = True,
+                                           optStandalone = True }))
+                 "" -- "Make slide shows include all the needed js and css"
+                 -- deprecated synonym for --self-contained
+
     , Option "5" ["html5"]
                  (NoArg
-                  (\opt -> return opt { optHtml5 = True }))
+                  (\opt -> do
+                     warn $ "--html5 is deprecated. "
+                       ++ "Use the html5 output format instead."
+                     return opt { optHtml5 = True }))
                  "" -- "Produce HTML5 in HTML output"
+
+    , Option "" ["ascii"]
+                 (NoArg
+                  (\opt -> return opt { optAscii = True }))
+                 ""  -- "Use ascii characters only in HTML output"
+
+    , Option "" ["reference-links"]
+                 (NoArg
+                  (\opt -> return opt { optReferenceLinks = True } ))
+                 "" -- "Use reference links in parsing HTML"
+
+    , Option "" ["atx-headers"]
+                 (NoArg
+                  (\opt -> return opt { optSetextHeaders = False } ))
+                 "" -- "Use atx-style headers for markdown"
+
+    , Option "" ["chapters"]
+                 (NoArg
+                  (\opt -> return opt { optChapters = True }))
+                 "" -- "Use chapter for top-level sections in LaTeX, DocBook"
+
+    , Option "N" ["number-sections"]
+                 (NoArg
+                  (\opt -> return opt { optNumberSections = True }))
+                 "" -- "Number sections in LaTeX"
+
+    , Option "" ["no-tex-ligatures"]
+                 (NoArg
+                  (\opt -> return opt { optTeXLigatures = False }))
+                 "" -- "Don't use tex ligatures for quotes, dashes"
+
+    , Option "" ["listings"]
+                 (NoArg
+                  (\opt -> return opt { optListings = True }))
+                 "" -- "Use listings package for LaTeX code blocks"
+
+    , Option "i" ["incremental"]
+                 (NoArg
+                  (\opt -> return opt { optIncremental = True }))
+                 "" -- "Make list items display incrementally in Slidy/Slideous/S5"
+
+    , Option "" ["slide-level"]
+                 (ReqArg
+                  (\arg opt -> do
+                      case safeRead arg of
+                           Just t | t >= 1 && t <= 6 ->
+                                    return opt { optSlideLevel = Just t }
+                           _      -> err 39 $
+                                    "slide level must be a number between 1 and 6")
+                 "NUMBER")
+                 "" -- "Force header level for slides"
+
+    , Option "" ["section-divs"]
+                 (NoArg
+                  (\opt -> return opt { optSectionDivs = True }))
+                 "" -- "Put sections in div tags in HTML"
+
+    , Option "" ["email-obfuscation"]
+                 (ReqArg
+                  (\arg opt -> do
+                     method <- case arg of
+                            "references" -> return ReferenceObfuscation
+                            "javascript" -> return JavascriptObfuscation
+                            "none"       -> return NoObfuscation
+                            _            -> err 6
+                               ("Unknown obfuscation method: " ++ arg)
+                     return opt { optEmailObfuscation = method })
+                  "none|javascript|references")
+                 "" -- "Method for obfuscating email in HTML"
+
+     , Option "" ["id-prefix"]
+                  (ReqArg
+                   (\arg opt -> return opt { optIdentifierPrefix = arg })
+                   "STRING")
+                  "" -- "Prefix to add to automatically generated HTML identifiers"
+
+    , Option "T" ["title-prefix"]
+                 (ReqArg
+                  (\arg opt -> do
+                    let newvars = ("title-prefix", arg) : optVariables opt
+                    return opt { optVariables = newvars,
+                                 optStandalone = True })
+                  "STRING")
+                 "" -- "String to prefix to HTML window title"
+
+    , Option "c" ["css"]
+                 (ReqArg
+                  (\arg opt -> do
+                     -- add new link to end, so it is included in proper order
+                     let newvars = optVariables opt ++ [("css",arg)]
+                     return opt { optVariables = newvars,
+                                  optStandalone = True })
+                  "URL")
+                 "" -- "Link to CSS style sheet"
+
+    , Option "" ["reference-odt"]
+                 (ReqArg
+                  (\arg opt -> do
+                    return opt { optReferenceODT = Just arg })
+                  "FILENAME")
+                 "" -- "Path of custom reference.odt"
+
+    , Option "" ["reference-docx"]
+                 (ReqArg
+                  (\arg opt -> do
+                    return opt { optReferenceDocx = Just arg })
+                  "FILENAME")
+                 "" -- "Path of custom reference.docx"
+
+    , Option "" ["epub-stylesheet"]
+                 (ReqArg
+                  (\arg opt -> do
+                     text <- UTF8.readFile arg
+                     return opt { optEPUBStylesheet = Just text })
+                  "FILENAME")
+                 "" -- "Path of epub.css"
+
+    , Option "" ["epub-cover-image"]
+                 (ReqArg
+                  (\arg opt ->
+                     return opt { optVariables =
+                                 ("epub-cover-image", arg) : optVariables opt })
+                  "FILENAME")
+                 "" -- "Path of epub cover image"
+
+    , Option "" ["epub-metadata"]
+                 (ReqArg
+                  (\arg opt -> do
+                     text <- UTF8.readFile arg
+                     return opt { optEPUBMetadata = text })
+                  "FILENAME")
+                 "" -- "Path of epub metadata file"
+
+    , Option "" ["epub-embed-font"]
+                 (ReqArg
+                  (\arg opt -> do
+                     return opt{ optEPUBFonts = arg : optEPUBFonts opt })
+                  "FILE")
+                 "" -- "Directory of fonts to embed"
+
+    , Option "" ["latex-engine"]
+                 (ReqArg
+                  (\arg opt -> do
+                     let b = takeBaseName arg
+                     if (b == "pdflatex" || b == "lualatex" || b == "xelatex")
+                        then return opt { optLaTeXEngine = arg }
+                        else err 45 "latex-engine must be pdflatex, lualatex, or xelatex.")
+                  "PROGRAM")
+                 "" -- "Name of latex program to use in generating PDF"
+
+    , Option "" ["bibliography"]
+                 (ReqArg
+                  (\arg opt -> return opt { optBibliography = (optBibliography opt) ++ [arg] })
+                  "FILENAME")
+                 ""
+
+    , Option "" ["csl"]
+                 (ReqArg
+                  (\arg opt -> return opt { optCslFile = Just arg })
+                  "FILENAME")
+                 ""
+
+    , Option "" ["citation-abbreviations"]
+                 (ReqArg
+                  (\arg opt -> return opt { optAbbrevsFile = Just arg })
+                  "FILENAME")
+                 ""
+
+    , Option "" ["natbib"]
+                 (NoArg
+                  (\opt -> return opt { optCiteMethod = Natbib }))
+                 "" -- "Use natbib cite commands in LaTeX output"
+
+    , Option "" ["biblatex"]
+                 (NoArg
+                  (\opt -> return opt { optCiteMethod = Biblatex }))
+                 "" -- "Use biblatex cite commands in LaTeX output"
 
     , Option "m" ["latexmathml", "asciimathml"]
                  (OptArg
@@ -284,8 +633,12 @@ options =
                  "" -- "Use jsMath for HTML math"
 
     , Option "" ["mathjax"]
-                 (ReqArg
-                  (\arg opt -> return opt { optHTMLMathMethod = MathJax arg})
+                 (OptArg
+                  (\arg opt -> do
+                      let url' = case arg of
+                                      Just u   -> u
+                                      Nothing  -> "http://cdn.mathjax.org/mathjax/latest/MathJax.js?config=TeX-AMS-MML_HTMLorMML"
+                      return opt { optHTMLMathMethod = MathJax url'})
                   "URL")
                  "" -- "Use MathJax for HTML math"
 
@@ -293,242 +646,6 @@ options =
                  (NoArg
                   (\opt -> return opt { optHTMLMathMethod = GladTeX }))
                  "" -- "Use gladtex for HTML math"
-
-    , Option "i" ["incremental"]
-                 (NoArg
-                  (\opt -> return opt { optIncremental = True }))
-                 "" -- "Make list items display incrementally in Slidy/S5"
-
-    , Option "" ["offline"]
-                 (NoArg
-                  (\opt -> return opt { optOffline = True,
-                                        optStandalone = True }))
-                 "" -- "Make slide shows include all the needed js and css"
-
-    , Option "" ["xetex"]
-                 (NoArg
-                  (\opt -> return opt { optXeTeX = True }))
-                 "" -- "Format latex for processing by XeTeX"
-
-    , Option "" ["chapters"]
-                 (NoArg
-                  (\opt -> return opt { optChapters = True }))
-                 "" -- "Use chapter for top-level sections in LaTeX, DocBook"
-
-    , Option "N" ["number-sections"]
-                 (NoArg
-                  (\opt -> return opt { optNumberSections = True }))
-                 "" -- "Number sections in LaTeX"
-
-    , Option "" ["listings"]
-                 (NoArg
-                  (\opt -> return opt { optListings = True }))
-                 "" -- "Use listings package for LaTeX code blocks"
-
-    , Option "" ["section-divs"]
-                 (NoArg
-                  (\opt -> return opt { optSectionDivs = True }))
-                 "" -- "Put sections in div tags in HTML"
-
-    , Option "" ["no-wrap"]
-                 (NoArg
-                  (\opt -> return opt { optWrapText = False }))
-                 "" -- "Do not wrap text in output"
-
-    , Option "" ["columns"]
-                 (ReqArg
-                  (\arg opt ->
-                      case reads arg of
-                           [(t,"")] | t > 0 -> return opt { optColumns = t }
-                           _          -> do
-                               UTF8.hPutStrLn stderr $
-                                   "columns must be a number greater than 0"
-                               exitWith $ ExitFailure 33)
-                 "NUMBER")
-                 "" -- "Length of line in characters"
-
-    , Option "" ["email-obfuscation"]
-                 (ReqArg
-                  (\arg opt -> do
-                     method <- case arg of
-                            "references" -> return ReferenceObfuscation
-                            "javascript" -> return JavascriptObfuscation
-                            "none"       -> return NoObfuscation
-                            _            -> UTF8.hPutStrLn stderr ("Error: Unknown obfuscation method: " ++ arg) >>
-                                            exitWith (ExitFailure 6)
-                     return opt { optEmailObfuscation = method })
-                  "none|javascript|references")
-                 "" -- "Method for obfuscating email in HTML"
-
-     , Option "" ["id-prefix"]
-                  (ReqArg
-                   (\arg opt -> return opt { optIdentifierPrefix = arg })
-                   "STRING")
-                  "" -- "Prefix to add to automatically generated HTML identifiers"
-
-     , Option "" ["indented-code-classes"]
-                  (ReqArg
-                   (\arg opt -> return opt { optIndentedCodeClasses = words $
-                                             map (\c -> if c == ',' then ' ' else c) arg })
-                   "STRING")
-                  "" -- "Classes (whitespace- or comma-separated) to use for indented code-blocks"
-
-    , Option "" ["toc", "table-of-contents"]
-                (NoArg
-                 (\opt -> return opt { optTableOfContents = True }))
-               "" -- "Include table of contents"
-
-    , Option "" ["base-header-level"]
-                 (ReqArg
-                  (\arg opt ->
-                      case reads arg of
-                           [(t,"")] | t > 0 -> do
-                               let oldTransforms = optTransforms opt
-                               let shift = t - 1
-                               return opt{ optTransforms =
-                                           headerShift shift : oldTransforms }
-                           _          -> do
-                               UTF8.hPutStrLn stderr $
-                                   "base-header-level must be a number > 0"
-                               exitWith $ ExitFailure 19)
-                  "NUMBER")
-                 "" -- "Headers base level"
-
-    , Option "" ["template"]
-                 (ReqArg
-                  (\arg opt -> do
-                     text <- UTF8.readFile arg
-                     return opt{ optTemplate = text,
-                                 optStandalone = True })
-                  "FILENAME")
-                 "" -- "Use custom template"
-
-    , Option "V" ["variable"]
-                 (ReqArg
-                  (\arg opt ->
-                     case break (`elem` ":=") arg of
-                          (k,_:v) -> do
-                            let newvars = optVariables opt ++ [(k,v)]
-                            return opt{ optVariables = newvars }
-                          _  -> do
-                            UTF8.hPutStrLn stderr $ "Could not parse `" ++ arg ++ "' as a key/value pair (k=v or k:v)"
-                            exitWith $ ExitFailure 17)
-                  "KEY:VALUE")
-                 "" -- "Use custom template"
-
-    , Option "c" ["css"]
-                 (ReqArg
-                  (\arg opt -> do
-                     -- add new link to end, so it is included in proper order
-                     let newvars = optVariables opt ++ [("css",arg)]
-                     return opt { optVariables = newvars,
-                                  optStandalone = True })
-                  "URL")
-                 "" -- "Link to CSS style sheet"
-
-    , Option "H" ["include-in-header"]
-                 (ReqArg
-                  (\arg opt -> do
-                     text <- UTF8.readFile arg
-                     -- add new ones to end, so they're included in order specified
-                     let newvars = optVariables opt ++ [("header-includes",text)]
-                     return opt { optVariables = newvars,
-                                  optStandalone = True })
-                  "FILENAME")
-                 "" -- "File to include at end of header (implies -s)"
-
-    , Option "B" ["include-before-body"]
-                 (ReqArg
-                  (\arg opt -> do
-                     text <- UTF8.readFile arg
-                     -- add new ones to end, so they're included in order specified
-                     let newvars = optVariables opt ++ [("include-before",text)]
-                     return opt { optVariables = newvars,
-                                  optStandalone = True })
-                  "FILENAME")
-                 "" -- "File to include before document body"
-
-    , Option "A" ["include-after-body"]
-                 (ReqArg
-                  (\arg opt -> do
-                     text <- UTF8.readFile arg
-                     -- add new ones to end, so they're included in order specified
-                     let newvars = optVariables opt ++ [("include-after",text)]
-                     return opt { optVariables = newvars,
-                                  optStandalone = True })
-                  "FILENAME")
-                 "" -- "File to include after document body"
-
-    , Option "T" ["title-prefix"]
-                 (ReqArg
-                  (\arg opt -> do
-                    let newvars = ("title-prefix", arg) : optVariables opt
-                    return opt { optVariables = newvars,
-                                 optStandalone = True })
-                  "STRING")
-                 "" -- "String to prefix to HTML window title"
-
-    , Option "" ["reference-odt"]
-                 (ReqArg
-                  (\arg opt -> do
-                    return opt { optReferenceODT = Just arg })
-                  "FILENAME")
-                 "" -- "Path of custom reference.odt"
-
-    , Option "" ["epub-stylesheet"]
-                 (ReqArg
-                  (\arg opt -> do
-                     text <- UTF8.readFile arg
-                     return opt { optEPUBStylesheet = Just text })
-                  "FILENAME")
-                 "" -- "Path of epub.css"
-
-    , Option "" ["epub-metadata"]
-                 (ReqArg
-                  (\arg opt -> do
-                     text <- UTF8.readFile arg
-                     return opt { optEPUBMetadata = text })
-                  "FILENAME")
-                 "" -- "Path of epub metadata file"
-
-    , Option "D" ["print-default-template"]
-                 (ReqArg
-                  (\arg _ -> do
-                     templ <- getDefaultTemplate Nothing arg
-                     case templ of
-                          Right t -> UTF8.hPutStr stdout t
-                          Left e  -> error $ show e
-                     exitWith ExitSuccess)
-                  "FORMAT")
-                 "" -- "Print default template for FORMAT"
-
-    , Option "" ["bibliography"]
-                 (ReqArg
-                  (\arg opt -> return opt { optBibliography = (optBibliography opt) ++ [arg] })
-                  "FILENAME")
-                 ""
-
-    , Option "" ["csl"]
-                 (ReqArg
-                  (\arg opt -> return opt { optCslFile = arg })
-                  "FILENAME")
-                 ""
-
-    , Option "" ["natbib"]
-                 (NoArg
-                  (\opt -> return opt { optCiteMethod = Natbib }))
-                 "" -- "Use natbib cite commands in LaTeX output"
-
-    , Option "" ["biblatex"]
-                 (NoArg
-                  (\opt -> return opt { optCiteMethod = Biblatex }))
-                 "" -- "Use biblatex cite commands in LaTeX output"
-
-    , Option "" ["data-dir"]
-                 (ReqArg
-                  (\arg opt -> return opt { optDataDir = Just arg })
-                 "DIRECTORY") -- "Directory containing pandoc data files."
-                ""
 
     , Option "" ["dump-args"]
                  (NoArg
@@ -556,14 +673,23 @@ options =
                      UTF8.hPutStr stdout (usageMessage prg options)
                      exitWith ExitSuccess ))
                  "" -- "Show help"
+
     ]
+
+readExtension :: String -> IO Extension
+readExtension s = case safeRead ('E':'x':'t':'_':map toLower s) of
+                       Just ext -> return ext
+                       Nothing  -> err 59 $ "Unknown extension: " ++ s
 
 -- Returns usage message
 usageMessage :: String -> [OptDescr (Opt -> IO Opt)] -> String
 usageMessage programName = usageInfo
   (programName ++ " [OPTIONS] [FILES]" ++ "\nInput formats:  " ++
-  (intercalate ", " $ map fst readers) ++ "\nOutput formats:  " ++
-  (intercalate ", " $ map fst writers ++ ["odt","epub"]) ++ "\nOptions:")
+  (wrapWords 16 78 $ readers'names) ++ "\nOutput formats: " ++
+  (wrapWords 16 78 $ writers'names) ++ "\nOptions:")
+  where
+    writers'names = map fst writers
+    readers'names = map fst readers
 
 -- Determine default reader based on source file extensions
 defaultReaderName :: String -> [FilePath] -> String
@@ -578,6 +704,8 @@ defaultReaderName fallback (x:xs) =
     ".ltx"      -> "latex"
     ".rst"      -> "rst"
     ".lhs"      -> "markdown+lhs"
+    ".db"       -> "docbook"
+    ".wiki"     -> "mediawiki"
     ".textile"  -> "textile"
     ".native"   -> "native"
     ".json"     -> "json"
@@ -614,15 +742,19 @@ defaultWriterName x =
     ".texinfo"  -> "texinfo"
     ".db"       -> "docbook"
     ".odt"      -> "odt"
+    ".docx"     -> "docx"
     ".epub"     -> "epub"
     ".org"      -> "org"
+    ".asciidoc" -> "asciidoc"
+    ".pdf"      -> "latex"
+    ".fb2"      -> "fb2"
     ['.',y] | y `elem` ['1'..'9'] -> "man"
     _          -> "html"
 
 main :: IO ()
 main = do
 
-  rawArgs <- liftM (map decodeString) getArgs
+  rawArgs <- liftM (map UTF8.decodeArg) getArgs
   prg <- getProgName
   let compatMode = (prg == "hsmarkdown")
 
@@ -631,15 +763,14 @@ main = do
                                   else getOpt Permute options rawArgs
 
   unless (null errors) $
-    do name <- getProgName
-       mapM_ (\e -> UTF8.hPutStr stderr (name ++ ": ") >> UTF8.hPutStr stderr e) errors
-       UTF8.hPutStrLn stderr $ "Try " ++ name ++ " --help for more information."
-       exitWith $ ExitFailure 2
+     err 2 $ concat $ errors ++
+        ["Try " ++ prg ++ " --help for more information."]
 
   let defaultOpts' = if compatMode
-                       then defaultOpts { optReader = "markdown"
+                       then defaultOpts { optReader = "markdown_strict"
                                         , optWriter = "html"
-                                        , optStrict = True }
+                                        , optEmailObfuscation =
+                                           ReferenceObfuscation }
                        else defaultOpts
 
   -- thread option data structure through all supplied option actions
@@ -654,23 +785,26 @@ main = do
               , optVariables         = variables
               , optTableOfContents   = toc
               , optTransforms        = transforms
-              , optTemplate          = template
+              , optTemplate          = templatePath
               , optOutputFile        = outputFile
               , optNumberSections    = numberSections
               , optSectionDivs       = sectionDivs
               , optIncremental       = incremental
-              , optOffline           = offline
-              , optXeTeX             = xetex
+              , optSelfContained     = selfContained
               , optSmart             = smart
+              , optOldDashes         = oldDashes
               , optHtml5             = html5
+              , optHighlight         = highlight
+              , optHighlightStyle    = highlightStyle
               , optChapters          = chapters
               , optHTMLMathMethod    = mathMethod
               , optReferenceODT      = referenceODT
+              , optReferenceDocx     = referenceDocx
               , optEPUBStylesheet    = epubStylesheet
               , optEPUBMetadata      = epubMetadata
+              , optEPUBFonts         = epubFonts
               , optDumpArgs          = dumpArgs
               , optIgnoreArgs        = ignoreArgs
-              , optStrict            = strict
               , optReferenceLinks    = referenceLinks
               , optWrapText          = wrap
               , optColumns           = columns
@@ -679,9 +813,15 @@ main = do
               , optIndentedCodeClasses = codeBlockClasses
               , optDataDir           = mbDataDir
               , optBibliography      = reffiles
-              , optCslFile           = cslfile
+              , optCslFile           = mbCsl
+              , optAbbrevsFile       = cslabbrevs
               , optCiteMethod        = citeMethod
-              , optListings          = listings 
+              , optListings          = listings
+              , optLaTeXEngine       = latexEngine
+              , optSlideLevel        = slideLevel
+              , optSetextHeaders     = setextHeaders
+              , optAscii             = ascii
+              , optTeXLigatures      = texLigatures
              } = opts
 
   when dumpArgs $
@@ -692,9 +832,10 @@ main = do
   let sources = if ignoreArgs then [] else args
 
   datadir <- case mbDataDir of
-                  Nothing   -> catch
+                  Nothing   -> E.catch
                                  (liftM Just $ getAppUserDataDirectory "pandoc")
-                                 (const $ return Nothing)
+                                 (\e -> let _ = (e :: E.SomeException)
+                                        in  return Nothing)
                   Just _    -> return mbDataDir
 
   -- assign reader and writer based on options and filenames
@@ -703,112 +844,157 @@ main = do
                                              then "html"
                                              else "markdown"
                            in  defaultReaderName fallback sources
-                      else readerName 
+                      else readerName
 
   let writerName' = if null writerName
                       then defaultWriterName outputFile
                       else writerName
 
-  reader <- case (lookup readerName' readers) of
-     Just r  -> return r
-     Nothing -> error ("Unknown reader: " ++ readerName')
+  let pdfOutput = map toLower (takeExtension outputFile) == ".pdf"
 
-  templ <- getDefaultTemplate datadir writerName'
-  let defaultTemplate = case templ of
-                             Right t -> t
-                             Left  e -> error (show e)
+  let laTeXOutput = "latex" `isPrefixOf` writerName' ||
+                    "beamer" `isPrefixOf` writerName'
 
-  let standalone' = standalone || isNonTextOutput writerName'
+  when pdfOutput $ do
+    -- make sure writer is latex or beamer
+    unless laTeXOutput $
+      err 47 $ "cannot produce pdf output with " ++ writerName' ++ " writer"
+    -- check for latex program
+    mbLatex <- findExecutable latexEngine
+    case mbLatex of
+         Nothing  -> err 41 $
+           latexEngine ++ " not found. " ++
+           latexEngine ++ " is needed for pdf output."
+         Just _   -> return ()
 
-  variables' <- case (writerName', standalone', offline) of
-                      ("s5", True, True) -> do
-                        inc <- s5HeaderIncludes datadir
-                        return $ ("s5includes", inc) : variables
-                      ("slidy", True, True) -> do
-                        slidyJs <- readDataFile datadir $
-                                      "slidy" </> "slidy.min.js"
-                        slidyCss <- readDataFile datadir $
-                                      "slidy" </> "slidy.min.css"
-                        return $ ("slidy-js", slidyJs) :
-                            ("slidy-css", slidyCss) : variables
-                      _ -> return variables
+  reader <- case getReader readerName' of
+     Right r  -> return r
+     Left e   -> err 7 e
 
-  variables'' <- case mathMethod of
+  let standalone' = standalone || not (isTextFormat writerName') || pdfOutput
+
+  templ <- case templatePath of
+                _ | not standalone' -> return ""
+                Nothing -> do
+                           deftemp <- getDefaultTemplate datadir writerName'
+                           case deftemp of
+                                 Left e   -> throwIO e
+                                 Right t  -> return t
+                Just tp -> do
+                           -- strip off extensions
+                           let format = takeWhile (`notElem` "+-") writerName'
+                           let tp' = case takeExtension tp of
+                                          ""   -> tp <.> format
+                                          _    -> tp
+                           E.catch (UTF8.readFile tp')
+                             (\e -> if isDoesNotExistError e
+                                       then E.catch
+                                             (readDataFile datadir $
+                                               "templates" </> tp')
+                                             (\e' -> let _ = (e' :: E.SomeException)
+                                                     in throwIO e')
+                                       else throwIO e)
+
+  variables' <- case mathMethod of
                       LaTeXMathML Nothing -> do
                          s <- readDataFile datadir $ "data" </> "LaTeXMathML.js"
-                         return $ ("mathml-script", s) : variables'
+                         return $ ("mathml-script", s) : variables
                       MathML Nothing -> do
                          s <- readDataFile datadir $ "data"</>"MathMLinHTML.js"
-                         return $ ("mathml-script", s) : variables'
-                      _ -> return variables'
+                         return $ ("mathml-script", s) : variables
+                      _ -> return variables
 
-  refs <- mapM (\f -> catch (readBiblioFile f) $ \e -> do
-         UTF8.hPutStrLn stderr $ "Error reading bibliography `" ++ f ++ "'"
-         UTF8.hPutStrLn stderr $ show e
-         exitWith (ExitFailure 23)) reffiles >>= \rs -> return $ concat rs
+  variables'' <- if "dzslides" `isPrefixOf` writerName'
+                    then do
+                        dztempl <- readDataFile datadir $ "dzslides" </> "template.html"
+                        let dzcore = unlines $ dropWhile (not . isPrefixOf "<!-- {{{{ dzslides core")
+                                             $ lines dztempl
+                        return $ ("dzslides-core", dzcore) : variables'
+                    else return variables'
+
+  -- unescape reference ids, which may contain XML entities, so
+  -- that we can do lookups with regular string equality
+  let unescapeRefId ref = ref{ refId = fromEntities (refId ref) }
+
+  refs <- mapM (\f -> E.catch (CSL.readBiblioFile f)
+                   (\e -> let _ = (e :: E.SomeException)
+                          in  err 23 $ "Error reading bibliography `" ++ f ++
+                                       "'" ++ "\n" ++ show e))
+          reffiles >>=
+           return . map unescapeRefId . concat
+
+  mbsty <- if citeMethod == Citeproc && not (null refs)
+              then do
+                csl <- CSL.parseCSL =<<
+                        case mbCsl of
+                            Nothing      -> readDataFile datadir "default.csl"
+                            Just cslfile -> do
+                                  exists <- doesFileExist cslfile
+                                  if exists
+                                     then UTF8.readFile cslfile
+                                     else do
+                                       csldir <- getAppUserDataDirectory "csl"
+                                       readDataFile (Just csldir)
+                                          (replaceExtension cslfile "csl")
+                abbrevs <- maybe (return []) CSL.readJsonAbbrevFile cslabbrevs
+                return $ Just csl { CSL.styleAbbrevs = abbrevs }
+              else return Nothing
 
   let sourceDir = if null sources
                      then "."
                      else takeDirectory (head sources)
 
-  let slideVariant = case writerName' of
-                           "s5"    -> S5Slides
-                           "slidy" -> SlidySlides
-                           _       -> NoSlides
+  let readerOpts = def{ readerSmart = smart || (texLigatures &&
+                          (laTeXOutput || "context" `isPrefixOf` writerName'))
+                      , readerStandalone = standalone'
+                      , readerParseRaw = parseRaw
+                      , readerColumns = columns
+                      , readerTabStop = tabStop
+                      , readerOldDashes = oldDashes
+                      , readerReferences = refs
+                      , readerCitationStyle = mbsty
+                      , readerIndentedCodeClasses = codeBlockClasses
+                      , readerApplyMacros = not laTeXOutput
+                      }
 
-  let startParserState =
-         defaultParserState { stateParseRaw        = parseRaw,
-                              stateTabStop         = tabStop,
-                              stateLiterateHaskell = "+lhs" `isSuffixOf` readerName' ||
-                                                     lhsExtension sources,
-                              stateStandalone      = standalone',
-                              stateCitations       = map refId refs,
-                              stateSmart           = smart || writerName' `elem`
-                                                              ["latex", "context", "latex+lhs", "man"],
-                              stateColumns         = columns,
-                              stateStrict          = strict,
-                              stateIndentedCodeClasses = codeBlockClasses,
-                              stateApplyMacros     = writerName' `notElem` ["latex", "latex+lhs"] }
+  let writerOptions = def { writerStandalone       = standalone',
+                            writerTemplate         = templ,
+                            writerVariables        = variables'',
+                            writerEPUBMetadata     = epubMetadata,
+                            writerTabStop          = tabStop,
+                            writerTableOfContents  = toc,
+                            writerHTMLMathMethod   = mathMethod,
+                            writerIncremental      = incremental,
+                            writerCiteMethod       = citeMethod,
+                            writerBiblioFiles      = reffiles,
+                            writerIgnoreNotes      = False,
+                            writerNumberSections   = numberSections,
+                            writerSectionDivs      = sectionDivs,
+                            writerReferenceLinks   = referenceLinks,
+                            writerWrapText         = wrap,
+                            writerColumns          = columns,
+                            writerEmailObfuscation = obfuscationMethod,
+                            writerIdentifierPrefix = idPrefix,
+                            writerSourceDirectory  = sourceDir,
+                            writerUserDataDir      = datadir,
+                            writerHtml5            = html5,
+                            writerChapters         = chapters,
+                            writerListings         = listings,
+                            writerBeamer           = False,
+                            writerSlideLevel       = slideLevel,
+                            writerHighlight        = highlight,
+                            writerHighlightStyle   = highlightStyle,
+                            writerSetextHeaders    = setextHeaders,
+                            writerTeXLigatures     = texLigatures,
+                            writerEpubStylesheet   = epubStylesheet,
+                            writerEpubFonts        = epubFonts,
+                            writerReferenceODT     = referenceODT,
+                            writerReferenceDocx    = referenceDocx
+                          }
 
-  let writerOptions = WriterOptions { writerStandalone       = standalone',
-                                      writerTemplate         = if null template
-                                                                  then defaultTemplate
-                                                                  else template,
-                                      writerVariables        = variables'',
-                                      writerEPUBMetadata     = epubMetadata,
-                                      writerTabStop          = tabStop,
-                                      writerTableOfContents  = toc &&
-                                                               writerName' /= "s5",
-                                      writerHTMLMathMethod   = mathMethod,
-                                      writerSlideVariant     = slideVariant,
-                                      writerIncremental      = incremental,
-                                      writerXeTeX            = xetex,
-                                      writerCiteMethod       = citeMethod,
-                                      writerBiblioFiles      = reffiles,
-                                      writerIgnoreNotes      = False,
-                                      writerNumberSections   = numberSections,
-                                      writerSectionDivs      = sectionDivs,
-                                      writerStrictMarkdown   = strict,
-                                      writerReferenceLinks   = referenceLinks,
-                                      writerWrapText         = wrap,
-                                      writerColumns          = columns,
-                                      writerLiterateHaskell  = "+lhs" `isSuffixOf` writerName' ||
-                                                               lhsExtension [outputFile],
-                                      writerEmailObfuscation = if strict
-                                                                  then ReferenceObfuscation
-                                                                  else obfuscationMethod,
-                                      writerIdentifierPrefix = idPrefix,
-                                      writerSourceDirectory  = sourceDir,
-                                      writerUserDataDir      = datadir,
-                                      writerHtml5            = html5 &&
-                                                               "html" `isPrefixOf` writerName',
-                                      writerChapters         = chapters, 
-                                      writerListings         = listings }
-
-  when (isNonTextOutput writerName' && outputFile == "-") $
-    do UTF8.hPutStrLn stderr ("Error:  Cannot write " ++ writerName ++ " output to stdout.\n" ++
-                               "Specify an output file using the -o option.")
-       exitWith $ ExitFailure 5
+  when (not (isTextFormat writerName') && outputFile == "-") $
+    err 5 $ "Cannot write " ++ writerName' ++ " output to stdout.\n" ++
+            "Specify an output file using the -o option."
 
   let readSources [] = mapM readSource ["-"]
       readSources srcs = mapM readSource srcs
@@ -818,45 +1004,49 @@ main = do
                                        readURI u
                             _       -> UTF8.readFile src
       readURI uri = simpleHTTP (mkRequest GET uri) >>= getResponseBody >>=
-                      return . toString  -- treat all as UTF8
+                      return . UTF8.toStringLazy  -- treat all as UTF8
 
   let convertTabs = tabFilter (if preserveTabs then 0 else tabStop)
 
-  doc <- fmap (reader startParserState . convertTabs . intercalate "\n") (readSources sources)
+  let handleIncludes' = if readerName' == "latex" || readerName' == "latex+lhs"
+                           then handleIncludes
+                           else return
+
+  doc <- (reader readerOpts) `fmap` (readSources sources >>=
+             handleIncludes' . convertTabs . intercalate "\n")
 
   let doc0 = foldr ($) doc transforms
 
-  doc1 <- if writerName' == "rtf"
+  doc1 <- if "rtf" `isPrefixOf` writerName'
              then bottomUpM rtfEmbedImage doc0
              else return doc0
 
-  doc2 <- do
-          if citeMethod == Citeproc && not (null refs)
-             then do
-                csldir <- getAppUserDataDirectory "csl"
-                cslfile' <- if null cslfile
-                               then findDataFile datadir "default.csl"
-                               else do
-                                  ex <- doesFileExist cslfile
-                                  if ex
-                                     then return cslfile
-                                     else findDataFile datadir $
-                                            replaceDirectory
-                                            (replaceExtension cslfile "csl")
-                                            csldir
-                processBiblio cslfile' refs doc1
-             else return doc1
+  let writeBinary :: B.ByteString -> IO ()
+      writeBinary = B.writeFile (UTF8.encodePath outputFile)
 
-  case lookup writerName' writers of
-        Nothing | writerName' == "epub" ->
-           writeEPUB epubStylesheet writerOptions doc2
-           >>= B.writeFile (encodeString outputFile)
-        Nothing | writerName' == "odt"  ->
-           writeODT referenceODT writerOptions doc2
-           >>= B.writeFile (encodeString outputFile)
-        Just r  -> writerFn outputFile result
-            where writerFn "-" = UTF8.putStr
-                  writerFn f   = UTF8.writeFile f
-                  result       = r writerOptions doc2 ++
-                                 ['\n' | not standalone']
-        Nothing -> error $ "Unknown writer: " ++ writerName'
+  let writerFn :: FilePath -> String -> IO ()
+      writerFn "-" = UTF8.putStr
+      writerFn f   = UTF8.writeFile f
+
+  case getWriter writerName' of
+    Left e -> err 9 e
+    Right (IOStringWriter f) -> f writerOptions doc1 >>= writerFn outputFile
+    Right (IOByteStringWriter f) -> f writerOptions doc1 >>= writeBinary
+    Right (PureStringWriter f)
+      | pdfOutput -> do
+              res <- tex2pdf latexEngine $ f writerOptions doc1
+              case res of
+                   Right pdf -> writeBinary pdf
+                   Left err' -> err 43 $ UTF8.toStringLazy err'
+      | otherwise -> selfcontain (f writerOptions doc1 ++
+                                  ['\n' | not standalone'])
+                      >>= writerFn outputFile . handleEntities
+          where htmlFormat = writerName' `elem`
+                               ["html","html+lhs","html5","html5+lhs",
+                               "s5","slidy","slideous","dzslides"]
+                selfcontain = if selfContained && htmlFormat
+                                 then makeSelfContained datadir
+                                 else return
+                handleEntities = if htmlFormat && ascii
+                                    then toEntities
+                                    else id

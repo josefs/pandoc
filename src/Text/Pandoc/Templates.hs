@@ -1,4 +1,4 @@
-{-# LANGUAGE TypeSynonymInstances #-}
+{-# LANGUAGE TypeSynonymInstances, FlexibleInstances, CPP #-}
 {-
 Copyright (C) 2009-2010 John MacFarlane <jgm@berkeley.edu>
 
@@ -30,7 +30,7 @@ A simple templating system with variable substitution and conditionals.
 Example:
 
 > renderTemplate [("name","Sam"),("salary","50,000")] $
->    "Hi, $name$.  $if(salary)$You make $$$salary$.$else$No salary data.$endif$" 
+>    "Hi, $name$.  $if(salary)$You make $$$salary$.$else$No salary data.$endif$"
 > "Hi, John.  You make $50,000."
 
 A slot for an interpolated variable is a variable name surrounded
@@ -68,29 +68,43 @@ module Text.Pandoc.Templates ( renderTemplate
                              , TemplateTarget
                              , getDefaultTemplate ) where
 
-import Text.ParserCombinators.Parsec
-import Control.Monad (liftM, when, forM)
+import Text.Parsec
+import Control.Monad (liftM, when, forM, mzero)
 import System.FilePath
 import Data.List (intercalate, intersperse)
-import Text.XHtml (primHtml, Html)
-import Data.ByteString.Lazy.UTF8 (ByteString, fromString)
+#if MIN_VERSION_blaze_html(0,5,0)
+import Text.Blaze.Html (Html)
+import Text.Blaze.Internal (preEscapedString)
+#else
+import Text.Blaze (preEscapedString, Html)
+#endif
+import Text.Pandoc.UTF8 (fromStringLazy)
+import Data.ByteString.Lazy (ByteString)
 import Text.Pandoc.Shared (readDataFile)
 import qualified Control.Exception.Extensible as E (try, IOException)
 
 -- | Get default template for the specified writer.
-getDefaultTemplate :: (Maybe FilePath) -- ^ User data directory to search first 
-                   -> String           -- ^ Name of writer 
+getDefaultTemplate :: (Maybe FilePath) -- ^ User data directory to search first
+                   -> String           -- ^ Name of writer
                    -> IO (Either E.IOException String)
-getDefaultTemplate _ "native" = return $ Right ""
-getDefaultTemplate user "odt" = getDefaultTemplate user "opendocument"
 getDefaultTemplate user writer = do
-  let format = takeWhile (/='+') writer  -- strip off "+lhs" if present
-  let fname = "templates" </> format  <.> "template"
-  E.try $ readDataFile user fname
+  let format = takeWhile (`notElem` "+-") writer  -- strip off extensions
+  case format of
+       "native" -> return $ Right ""
+       "json"   -> return $ Right ""
+       "docx"   -> return $ Right ""
+       "epub"   -> return $ Right ""
+       "epub3"  -> return $ Right ""
+       "odt"    -> getDefaultTemplate user "opendocument"
+       "markdown_strict" -> getDefaultTemplate user "markdown"
+       "multimarkdown"   -> getDefaultTemplate user "markdown"
+       "markdown_github" -> getDefaultTemplate user "markdown"
+       _        -> let fname = "templates" </> "default" <.> format
+                   in  E.try $ readDataFile user fname
 
 data TemplateState = TemplateState Int [(String,String)]
 
-adjustPosition :: String -> GenParser Char TemplateState String
+adjustPosition :: String -> Parsec [Char] TemplateState String
 adjustPosition str = do
   let lastline = takeWhile (/= '\n') $ reverse str
   updateState $ \(TemplateState pos x) ->
@@ -100,18 +114,18 @@ adjustPosition str = do
   return str
 
 class TemplateTarget a where
-  toTarget :: String -> a 
+  toTarget :: String -> a
 
 instance TemplateTarget String where
   toTarget = id
 
-instance TemplateTarget ByteString where 
-  toTarget = fromString
+instance TemplateTarget ByteString where
+  toTarget = fromStringLazy
 
 instance TemplateTarget Html where
-  toTarget = primHtml
+  toTarget = preEscapedString
 
--- | Renders a template 
+-- | Renders a template
 renderTemplate :: TemplateTarget a
                => [(String,String)]  -- ^ Assoc. list of values for variables
                -> String             -- ^ Template
@@ -124,21 +138,21 @@ renderTemplate vals templ =
 reservedWords :: [String]
 reservedWords = ["else","endif","for","endfor","sep"]
 
-parseTemplate :: GenParser Char TemplateState [String]
+parseTemplate :: Parsec [Char] TemplateState [String]
 parseTemplate =
   many $ (plaintext <|> escapedDollar <|> conditional <|> for <|> variable)
            >>= adjustPosition
 
-plaintext :: GenParser Char TemplateState String
+plaintext :: Parsec [Char] TemplateState String
 plaintext = many1 $ noneOf "$"
 
-escapedDollar :: GenParser Char TemplateState String
+escapedDollar :: Parsec [Char] TemplateState String
 escapedDollar = try $ string "$$" >> return "$"
 
-skipEndline :: GenParser Char st ()
+skipEndline :: Parsec [Char] st ()
 skipEndline = try $ skipMany (oneOf " \t") >> newline >> return ()
 
-conditional :: GenParser Char TemplateState String
+conditional :: Parsec [Char] TemplateState String
 conditional = try $ do
   TemplateState pos vars <- getState
   string "$if("
@@ -162,7 +176,7 @@ conditional = try $ do
               then ifContents
               else elseContents
 
-for :: GenParser Char TemplateState String
+for :: Parsec [Char] TemplateState String
 for = try $ do
   TemplateState pos vars <- getState
   string "$for("
@@ -170,14 +184,14 @@ for = try $ do
   string ")$"
   -- if newline after the "for", then a newline after "endfor" will be swallowed
   multiline <- option False $ try $ skipEndline >> return True
-  let matches = filter (\(k,_) -> k == id') vars 
+  let matches = filter (\(k,_) -> k == id') vars
   let indent = replicate pos ' '
   contents <- forM matches $ \m -> do
                       updateState $ \(TemplateState p v) -> TemplateState p (m:v)
                       raw <- liftM concat $ lookAhead parseTemplate
                       return $ intercalate ('\n':indent) $ lines $ raw ++ "\n"
   parseTemplate
-  sep <- option "" $ do try (string "$sep$")  
+  sep <- option "" $ do try (string "$sep$")
                         when multiline $ optional skipEndline
                         liftM concat parseTemplate
   string "$endfor$"
@@ -185,16 +199,16 @@ for = try $ do
   setState $ TemplateState pos vars
   return $ concat $ intersperse sep contents
 
-ident :: GenParser Char TemplateState String
+ident :: Parsec [Char] TemplateState String
 ident = do
   first <- letter
   rest <- many (alphaNum <|> oneOf "_-")
   let id' = first : rest
   if id' `elem` reservedWords
-     then pzero
+     then mzero
      else return id'
 
-variable :: GenParser Char TemplateState String
+variable :: Parsec [Char] TemplateState String
 variable = try $ do
   char '$'
   id' <- ident

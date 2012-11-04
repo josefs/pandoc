@@ -20,7 +20,7 @@ Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
 {- |
    Module      : Text.Pandoc.Shared
    Copyright   : Copyright (C) 2006-2010 John MacFarlane
-   License     : GNU GPL, version 2 or above 
+   License     : GNU GPL, version 2 or above
 
    Maintainer  : John MacFarlane <jgm@berkeley.edu>
    Stability   : alpha
@@ -32,57 +32,70 @@ module Text.Pandoc.Shared (
                      -- * List processing
                      splitBy,
                      splitByIndices,
+                     splitStringByIndices,
                      substitute,
                      -- * Text processing
                      backslashEscapes,
                      escapeStringUsing,
                      stripTrailingNewlines,
-                     removeLeadingTrailingSpace,
-                     removeLeadingSpace,
-                     removeTrailingSpace,
+                     trim,
+                     triml,
+                     trimr,
                      stripFirstAndLast,
                      camelCaseToHyphenated,
                      toRomanNumeral,
                      escapeURI,
-                     unescapeURI,
                      tabFilter,
+                     -- * Date/time
+                     normalizeDate,
                      -- * Pandoc block and inline list processing
                      orderedListMarkers,
                      normalizeSpaces,
                      normalize,
                      stringify,
                      compactify,
+                     compactify',
                      Element (..),
                      hierarchicalize,
                      uniqueIdent,
                      isHeaderBlock,
                      headerShift,
-                     -- * Writer options
-                     HTMLMathMethod (..),
-                     CiteMethod (..),
-                     ObfuscationMethod (..),
-                     HTMLSlideVariant (..),
-                     WriterOptions (..),
-                     defaultWriterOptions,
+                     -- * TagSoup HTML handling
+                     renderTags',
                      -- * File handling
                      inDirectory,
                      findDataFile,
-                     readDataFile
+                     readDataFile,
+                     -- * Error handling
+                     err,
+                     warn,
+                     -- * Safe read
+                     safeRead
                     ) where
 
 import Text.Pandoc.Definition
 import Text.Pandoc.Generic
-import qualified Text.Pandoc.UTF8 as UTF8 (readFile)
-import Data.Char ( toLower, isLower, isUpper, isAlpha, isAscii,
-                   isLetter, isDigit )
+import Text.Pandoc.Builder (Blocks)
+import qualified Text.Pandoc.Builder as B
+import qualified Text.Pandoc.UTF8 as UTF8
+import System.Environment (getProgName)
+import System.Exit (exitWith, ExitCode(..))
+import Data.Char ( toLower, isLower, isUpper, isAlpha,
+                   isLetter, isDigit, isSpace )
 import Data.List ( find, isPrefixOf, intercalate )
-import Network.URI ( isAllowedInURI, escapeURIString, unEscapeString )
-import Codec.Binary.UTF8.String ( encodeString, decodeString )
+import Network.URI ( escapeURIString )
 import System.Directory
 import System.FilePath ( (</>) )
 import Data.Generics (Typeable, Data)
 import qualified Control.Monad.State as S
+import Control.Monad (msum)
 import Paths_pandoc (getDataFileName)
+import Text.Pandoc.Pretty (charWidth)
+import System.Locale (defaultTimeLocale)
+import Data.Time
+import System.IO (stderr)
+import Text.HTML.TagSoup (renderTagsOptions, RenderOptions(..), Tag(..),
+         renderOptions)
 
 --
 -- List processing
@@ -96,12 +109,23 @@ splitBy isSep lst =
       rest'         = dropWhile isSep rest
   in  first:(splitBy isSep rest')
 
--- | Split list into chunks divided at specified indices.
 splitByIndices :: [Int] -> [a] -> [[a]]
 splitByIndices [] lst = [lst]
-splitByIndices (x:xs) lst =
-    let (first, rest) = splitAt x lst in
-    first:(splitByIndices (map (\y -> y - x)  xs) rest)
+splitByIndices (x:xs) lst = first:(splitByIndices (map (\y -> y - x)  xs) rest)
+  where (first, rest) = splitAt x lst
+
+-- | Split string into chunks divided at specified indices.
+splitStringByIndices :: [Int] -> [Char] -> [[Char]]
+splitStringByIndices [] lst = [lst]
+splitStringByIndices (x:xs) lst =
+  let (first, rest) = splitAt' x lst in
+  first : (splitStringByIndices (map (\y -> y - x) xs) rest)
+
+splitAt' :: Int -> [Char] -> ([Char],[Char])
+splitAt' _ []          = ([],[])
+splitAt' n xs | n <= 0 = ([],xs)
+splitAt' n (x:xs)      = (x:ys,zs)
+  where (ys,zs) = splitAt' (n - charWidth x) xs
 
 -- | Replace each occurrence of one sublist in a list with another.
 substitute :: (Eq a) => [a] -> [a] -> [a] -> [a]
@@ -126,7 +150,7 @@ backslashEscapes = map (\ch -> (ch, ['\\',ch]))
 -- characters and strings.
 escapeStringUsing :: [(Char, String)] -> String -> String
 escapeStringUsing _ [] = ""
-escapeStringUsing escapeTable (x:xs) = 
+escapeStringUsing escapeTable (x:xs) =
   case (lookup x escapeTable) of
        Just str  -> str ++ rest
        Nothing   -> x:rest
@@ -137,23 +161,23 @@ stripTrailingNewlines :: String -> String
 stripTrailingNewlines = reverse . dropWhile (== '\n') . reverse
 
 -- | Remove leading and trailing space (including newlines) from string.
-removeLeadingTrailingSpace :: String -> String
-removeLeadingTrailingSpace = removeLeadingSpace . removeTrailingSpace
+trim :: String -> String
+trim = triml . trimr
 
 -- | Remove leading space (including newlines) from string.
-removeLeadingSpace :: String -> String
-removeLeadingSpace = dropWhile (`elem` " \n\t")
+triml :: String -> String
+triml = dropWhile (`elem` " \r\n\t")
 
 -- | Remove trailing space (including newlines) from string.
-removeTrailingSpace :: String -> String
-removeTrailingSpace = reverse . removeLeadingSpace . reverse
+trimr :: String -> String
+trimr = reverse . triml . reverse
 
 -- | Strip leading and trailing characters from string
 stripFirstAndLast :: String -> String
 stripFirstAndLast str =
   drop 1 $ take ((length str) - 1) str
 
--- | Change CamelCase word to hyphenated lowercase (e.g., camel-case). 
+-- | Change CamelCase word to hyphenated lowercase (e.g., camel-case).
 camelCaseToHyphenated :: String -> String
 camelCaseToHyphenated [] = ""
 camelCaseToHyphenated (a:b:rest) | isLower a && isUpper b =
@@ -181,16 +205,9 @@ toRomanNumeral x =
               _ | x >= 1    -> "I" ++ toRomanNumeral (x - 1)
               _             -> ""
 
--- | Escape unicode characters in a URI.  Characters that are
--- already valid in a URI, including % and ?, are left alone.
+-- | Escape whitespace in URI.
 escapeURI :: String -> String
-escapeURI = escapeURIString isAllowedInURI . encodeString
-
--- | Unescape unicode and some special characters in a URI, but
--- without introducing spaces.
-unescapeURI :: String -> String
-unescapeURI = escapeURIString (\c -> isAllowedInURI c || not (isAscii c)) .
-               decodeString . unEscapeString
+escapeURI = escapeURIString (not . isSpace)
 
 -- | Convert tabs to spaces and filter out DOS line endings.
 -- Tabs will be preserved if tab stop is set to 0.
@@ -213,19 +230,31 @@ tabFilter tabStop =
   in  go tabStop
 
 --
+-- Date/time
+--
+
+-- | Parse a date and convert (if possible) to "YYYY-MM-DD" format.
+normalizeDate :: String -> Maybe String
+normalizeDate s = fmap (formatTime defaultTimeLocale "%F")
+  (msum $ map (\fs -> parsetimeWith fs s) formats :: Maybe Day)
+   where parsetimeWith = parseTime defaultTimeLocale
+         formats = ["%x","%m/%d/%Y", "%D","%F", "%d %b %Y",
+                    "%d %B %Y", "%b. %d, %Y", "%B %d, %Y"]
+
+--
 -- Pandoc block and inline list processing
 --
 
 -- | Generate infinite lazy list of markers for an ordered list,
 -- depending on list attributes.
 orderedListMarkers :: (Int, ListNumberStyle, ListNumberDelim) -> [String]
-orderedListMarkers (start, numstyle, numdelim) = 
+orderedListMarkers (start, numstyle, numdelim) =
   let singleton c = [c]
       nums = case numstyle of
                      DefaultStyle -> map show [start..]
                      Example      -> map show [start..]
                      Decimal      -> map show [start..]
-                     UpperAlpha   -> drop (start - 1) $ cycle $ 
+                     UpperAlpha   -> drop (start - 1) $ cycle $
                                      map singleton ['A'..'Z']
                      LowerAlpha   -> drop (start - 1) $ cycle $
                                      map singleton ['a'..'z']
@@ -243,16 +272,17 @@ orderedListMarkers (start, numstyle, numdelim) =
 -- remove empty Str elements.
 normalizeSpaces :: [Inline] -> [Inline]
 normalizeSpaces = cleanup . dropWhile isSpaceOrEmpty
-  where isSpaceOrEmpty Space = True
-        isSpaceOrEmpty (Str "") = True
-        isSpaceOrEmpty _ = False
-        cleanup [] = []
-        cleanup (Space:rest) = let rest' = dropWhile isSpaceOrEmpty rest
-                               in  case rest' of
-                                   []            -> []
-                                   _             -> Space : cleanup rest'
+ where  cleanup []              = []
+        cleanup (Space:rest)    = case dropWhile isSpaceOrEmpty rest of
+                                        []     -> []
+                                        (x:xs) -> Space : x : cleanup xs
         cleanup ((Str ""):rest) = cleanup rest
-        cleanup (x:rest) = x : cleanup rest
+        cleanup (x:rest)        = x : cleanup rest
+
+isSpaceOrEmpty :: Inline -> Bool
+isSpaceOrEmpty Space = True
+isSpaceOrEmpty (Str "") = True
+isSpaceOrEmpty _ = False
 
 -- | Normalize @Pandoc@ document, consolidating doubled 'Space's,
 -- combining adjacent 'Str's and 'Emph's, remove 'Null's and
@@ -260,7 +290,7 @@ normalizeSpaces = cleanup . dropWhile isSpaceOrEmpty
 normalize :: (Eq a, Data a) => a -> a
 normalize = topDown removeEmptyBlocks .
             topDown consolidateInlines .
-            bottomUp removeEmptyInlines
+            bottomUp (removeEmptyInlines . removeTrailingInlineSpaces)
 
 removeEmptyBlocks :: [Block] -> [Block]
 removeEmptyBlocks (Null : xs) = removeEmptyBlocks xs
@@ -284,6 +314,12 @@ removeEmptyInlines (Str "" : zs) = removeEmptyInlines zs
 removeEmptyInlines (x : xs) = x : removeEmptyInlines xs
 removeEmptyInlines [] = []
 
+removeTrailingInlineSpaces :: [Inline] -> [Inline]
+removeTrailingInlineSpaces = reverse . removeLeadingInlineSpaces . reverse
+
+removeLeadingInlineSpaces :: [Inline] -> [Inline]
+removeLeadingInlineSpaces = dropWhile isSpaceOrEmpty
+
 consolidateInlines :: [Inline] -> [Inline]
 consolidateInlines (Str x : ys) =
   case concat (x : map fromStr strs) of
@@ -296,9 +332,9 @@ consolidateInlines (Str x : ys) =
      fromStr (Str z) = z
      fromStr _       = error "consolidateInlines - fromStr - not a Str"
 consolidateInlines (Space : ys) = Space : rest
-   where isSpace Space = True
-         isSpace _     = False
-         rest          = consolidateInlines $ dropWhile isSpace ys
+   where isSp Space = True
+         isSp _     = False
+         rest       = consolidateInlines $ dropWhile isSp ys
 consolidateInlines (Emph xs : Emph ys : zs) = consolidateInlines $
   Emph (xs ++ ys) : zs
 consolidateInlines (Strong xs : Strong ys : zs) = consolidateInlines $
@@ -326,10 +362,6 @@ stringify = queryWith go
         go (Str x) = x
         go (Code _ x) = x
         go (Math _ x) = x
-        go EmDash = "--"
-        go EnDash = "-"
-        go Apostrophe = "'"
-        go Ellipses = "..."
         go LineBreak = " "
         go _ = ""
 
@@ -349,12 +381,27 @@ compactify items =
                                 _   -> items
                  _      -> items
 
+-- | Change final list item from @Para@ to @Plain@ if the list contains
+-- no other @Para@ blocks.  Like compactify, but operates on @Blocks@ rather
+-- than @[Block]@.
+compactify' :: [Blocks]  -- ^ List of list items (each a list of blocks)
+           -> [Blocks]
+compactify' [] = []
+compactify' items =
+  let (others, final) = (init items, last items)
+  in  case reverse (B.toList final) of
+           (Para a:xs) -> case [Para x | Para x <- concatMap B.toList items] of
+                            -- if this is only Para, change to Plain
+                            [_] -> others ++ [B.fromList (reverse $ Plain a : xs)]
+                            _   -> items
+           _      -> items
+
 isPara :: Block -> Bool
 isPara (Para _) = True
 isPara _        = False
 
 -- | Data structure for defining hierarchical Pandoc documents
-data Element = Blk Block 
+data Element = Blk Block
              | Sec Int [Int] String [Inline] [Element]
              --    lvl  num ident  label    contents
              deriving (Eq, Read, Show, Typeable, Data)
@@ -382,7 +429,7 @@ hierarchicalizeWithIds ((Header level title'):xs) = do
   let ident = uniqueIdent title' usedIdents
   let lastnum' = take level lastnum
   let newnum = if length lastnum' >= level
-                  then init lastnum' ++ [last lastnum' + 1] 
+                  then init lastnum' ++ [last lastnum' + 1]
                   else lastnum ++ replicate (level - length lastnum - 1) 0 ++ [1]
   S.put (newnum, (ident : usedIdents))
   let (sectionContents, rest) = break (headerLtEq level) xs
@@ -424,97 +471,20 @@ headerShift n = bottomUp shift
         shift x                    = x
 
 --
--- Writer options
+-- TagSoup HTML handling
 --
 
-data HTMLMathMethod = PlainMath 
-                    | LaTeXMathML (Maybe String)  -- url of LaTeXMathML.js
-                    | JsMath (Maybe String)       -- url of jsMath load script
-                    | GladTeX
-                    | WebTeX String               -- url of TeX->image script.
-                    | MathML (Maybe String)       -- url of MathMLinHTML.js
-                    | MathJax String              -- url of MathJax.js
-                    deriving (Show, Read, Eq)
-
-data CiteMethod = Citeproc                        -- use citeproc to render them
-                  | Natbib                        -- output natbib cite commands
-                  | Biblatex                      -- output biblatex cite commands
-                deriving (Show, Read, Eq)
-
--- | Methods for obfuscating email addresses in HTML.
-data ObfuscationMethod = NoObfuscation
-                       | ReferenceObfuscation
-                       | JavascriptObfuscation
-                       deriving (Show, Read, Eq)
-
--- | Varieties of HTML slide shows.
-data HTMLSlideVariant = S5Slides
-                      | SlidySlides
-                      | NoSlides
-                      deriving (Show, Read, Eq)
-
--- | Options for writers
-data WriterOptions = WriterOptions
-  { writerStandalone       :: Bool   -- ^ Include header and footer
-  , writerTemplate         :: String -- ^ Template to use in standalone mode
-  , writerVariables        :: [(String, String)] -- ^ Variables to set in template
-  , writerEPUBMetadata     :: String -- ^ Metadata to include in EPUB
-  , writerTabStop          :: Int    -- ^ Tabstop for conversion btw spaces and tabs
-  , writerTableOfContents  :: Bool   -- ^ Include table of contents
-  , writerSlideVariant     :: HTMLSlideVariant -- ^ Are we writing S5 or Slidy?
-  , writerIncremental      :: Bool   -- ^ True if lists should be incremental
-  , writerXeTeX            :: Bool   -- ^ Create latex suitable for use by xetex
-  , writerHTMLMathMethod   :: HTMLMathMethod  -- ^ How to print math in HTML
-  , writerIgnoreNotes      :: Bool   -- ^ Ignore footnotes (used in making toc)
-  , writerNumberSections   :: Bool   -- ^ Number sections in LaTeX
-  , writerSectionDivs      :: Bool   -- ^ Put sections in div tags in HTML
-  , writerStrictMarkdown   :: Bool   -- ^ Use strict markdown syntax
-  , writerReferenceLinks   :: Bool   -- ^ Use reference links in writing markdown, rst
-  , writerWrapText         :: Bool   -- ^ Wrap text to line length
-  , writerColumns          :: Int    -- ^ Characters in a line (for text wrapping)
-  , writerLiterateHaskell  :: Bool   -- ^ Write as literate haskell
-  , writerEmailObfuscation :: ObfuscationMethod -- ^ How to obfuscate emails
-  , writerIdentifierPrefix :: String -- ^ Prefix for section & note ids in HTML
-  , writerSourceDirectory  :: FilePath -- ^ Directory path of 1st source file
-  , writerUserDataDir      :: Maybe FilePath -- ^ Path of user data directory
-  , writerCiteMethod       :: CiteMethod -- ^ How to print cites
-  , writerBiblioFiles      :: [FilePath] -- ^ Biblio files to use for citations
-  , writerHtml5            :: Bool       -- ^ Produce HTML5
-  , writerChapters         :: Bool       -- ^ Use "chapter" for top-level sects
-  , writerListings         :: Bool       -- ^ Use listings package for code
-  } deriving Show
-
--- | Default writer options.
-defaultWriterOptions :: WriterOptions
-defaultWriterOptions = 
-  WriterOptions { writerStandalone       = False
-                , writerTemplate         = ""
-                , writerVariables        = []
-                , writerEPUBMetadata     = ""
-                , writerTabStop          = 4
-                , writerTableOfContents  = False
-                , writerSlideVariant     = NoSlides
-                , writerIncremental      = False
-                , writerXeTeX            = False
-                , writerHTMLMathMethod   = PlainMath
-                , writerIgnoreNotes      = False
-                , writerNumberSections   = False
-                , writerSectionDivs      = True
-                , writerStrictMarkdown   = False
-                , writerReferenceLinks   = False
-                , writerWrapText         = True
-                , writerColumns          = 72
-                , writerLiterateHaskell  = False
-                , writerEmailObfuscation = JavascriptObfuscation
-                , writerIdentifierPrefix = ""
-                , writerSourceDirectory  = "."
-                , writerUserDataDir      = Nothing
-                , writerCiteMethod       = Citeproc
-                , writerBiblioFiles      = []
-                , writerHtml5            = False
-                , writerChapters         = False
-                , writerListings         = False
-                }
+-- | Render HTML tags.
+renderTags' :: [Tag String] -> String
+renderTags' = renderTagsOptions
+               renderOptions{ optMinimize = \x ->
+                                    let y = map toLower x
+                                    in  y == "hr" || y == "br" ||
+                                        y == "img" || y == "meta" ||
+                                        y == "link"
+                            , optRawTag = \x ->
+                                    let y = map toLower x
+                                    in  y == "script" || y == "style" }
 
 --
 -- File handling
@@ -543,3 +513,31 @@ findDataFile (Just u) f = do
 -- Cabal data directory.
 readDataFile :: Maybe FilePath -> FilePath -> IO String
 readDataFile userDir fname = findDataFile userDir fname >>= UTF8.readFile
+
+--
+-- Error reporting
+--
+
+err :: Int -> String -> IO a
+err exitCode msg = do
+  name <- getProgName
+  UTF8.hPutStrLn stderr $ name ++ ": " ++ msg
+  exitWith $ ExitFailure exitCode
+  return undefined
+
+warn :: String -> IO ()
+warn msg = do
+  name <- getProgName
+  UTF8.hPutStrLn stderr $ name ++ ": " ++ msg
+
+--
+-- Safe read
+--
+
+safeRead :: (Monad m, Read a) => String -> m a
+safeRead s = case reads s of
+                  (d,x):_
+                    | all isSpace x -> return d
+                  _                 -> fail $ "Could not read `" ++ s ++ "'"
+
+

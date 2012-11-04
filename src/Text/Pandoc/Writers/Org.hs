@@ -20,7 +20,7 @@ Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
 {- |
    Module      : Text.Pandoc.Writers.Org
    Copyright   : Copyright (C) 2010 Puneeth Chaganti
-   License     : GNU GPL, version 2 or above 
+   License     : GNU GPL, version 2 or above
 
    Maintainer  : Puneeth Chaganti <punchagan@gmail.com>
    Stability   : alpha
@@ -32,14 +32,15 @@ Org-Mode:  <http://orgmode.org>
 -}
 module Text.Pandoc.Writers.Org ( writeOrg) where
 import Text.Pandoc.Definition
-import Text.Pandoc.Shared 
+import Text.Pandoc.Options
+import Text.Pandoc.Shared
 import Text.Pandoc.Pretty
 import Text.Pandoc.Templates (renderTemplate)
 import Data.List ( intersect, intersperse, transpose )
 import Control.Monad.State
 import Control.Applicative ( (<$>) )
 
-data WriterState = 
+data WriterState =
   WriterState { stNotes     :: [[Block]]
               , stLinks     :: Bool
               , stImages    :: Bool
@@ -49,7 +50,7 @@ data WriterState =
 
 -- | Convert Pandoc to Org.
 writeOrg :: WriterOptions -> Pandoc -> String
-writeOrg opts document = 
+writeOrg opts document =
   let st = WriterState { stNotes = [], stLinks = False,
                          stImages = False, stHasMath = False,
                          stOptions = opts }
@@ -82,8 +83,8 @@ pandocToOrg (Pandoc (Meta tit auth dat) blocks) = do
 
 -- | Return Org representation of notes.
 notesToOrg :: [[Block]] -> State WriterState Doc
-notesToOrg notes = 
-  mapM (\(num, note) -> noteToOrg num note) (zip [1..] notes) >>= 
+notesToOrg notes =
+  mapM (\(num, note) -> noteToOrg num note) (zip [1..] notes) >>=
   return . vsep
 
 -- | Return Org representation of a note.
@@ -95,27 +96,35 @@ noteToOrg num note = do
 
 -- | Escape special characters for Org.
 escapeString :: String -> String
-escapeString = escapeStringUsing (backslashEscapes "^_")
+escapeString = escapeStringUsing $
+               [ ('\x2014',"---")
+               , ('\x2013',"--")
+               , ('\x2019',"'")
+               , ('\x2026',"...")
+               ] ++ backslashEscapes "^_"
 
 titleToOrg :: [Inline] -> State WriterState Doc
 titleToOrg [] = return empty
 titleToOrg lst = do
   contents <- inlineListToOrg lst
-  return $ "#+TITLE: " <> contents 
+  return $ "#+TITLE: " <> contents
 
--- | Convert Pandoc block element to Org. 
+-- | Convert Pandoc block element to Org.
 blockToOrg :: Block         -- ^ Block element
-           -> State WriterState Doc 
+           -> State WriterState Doc
 blockToOrg Null = return empty
 blockToOrg (Plain inlines) = inlineListToOrg inlines
 blockToOrg (Para [Image txt (src,tit)]) = do
-  capt <- inlineListToOrg txt
+  capt <- if null txt
+             then return empty
+             else (\c -> "#+CAPTION: " <> c <> blankline) `fmap`
+                    inlineListToOrg txt
   img <- inlineToOrg (Image txt (src,tit))
-  return $ "#+CAPTION: " <> capt <> blankline <> img
+  return $ capt <> img
 blockToOrg (Para inlines) = do
   contents <- inlineListToOrg inlines
   return $ contents <> blankline
-blockToOrg (RawBlock "html" str) = 
+blockToOrg (RawBlock "html" str) =
   return $ blankline $$ "#+BEGIN_HTML" $$
            nest 2 (text str) $$ "#+END_HTML" $$ blankline
 blockToOrg (RawBlock f str) | f == "org" || f == "latex" || f == "tex" =
@@ -129,17 +138,17 @@ blockToOrg (Header level inlines) = do
 blockToOrg (CodeBlock (_,classes,_) str) = do
   opts <- stOptions <$> get
   let tabstop = writerTabStop opts
-  let at = classes `intersect` ["asymptote", "C", "clojure", "css", "ditaa", 
-                    "dot", "emacs-lisp", "gnuplot", "haskell", "js", "latex", 
-                    "ledger", "lisp", "matlab", "mscgen", "ocaml", "octave", 
-                    "oz", "perl", "plantuml", "python", "R", "ruby", "sass", 
+  let at = classes `intersect` ["asymptote", "C", "clojure", "css", "ditaa",
+                    "dot", "emacs-lisp", "gnuplot", "haskell", "js", "latex",
+                    "ledger", "lisp", "matlab", "mscgen", "ocaml", "octave",
+                    "oz", "perl", "plantuml", "python", "R", "ruby", "sass",
                     "scheme", "screen", "sh", "sql", "sqlite"]
-  let (beg, end) = if null at
-                      then ("#+BEGIN_EXAMPLE", "#+END_EXAMPLE")
-                      else ("#+BEGIN_SRC" ++ head at, "#+END_SRC")
+  let (beg, end) = case at of
+                      []    -> ("#+BEGIN_EXAMPLE", "#+END_EXAMPLE")
+                      (x:_) -> ("#+BEGIN_SRC " ++ x, "#+END_SRC")
   return $ text beg $$ nest tabstop (text str) $$ text end $$ blankline
 blockToOrg (BlockQuote blocks) = do
-  contents <- blockListToOrg blocks 
+  contents <- blockListToOrg blocks
   return $ blankline $$ "#+BEGIN_QUOTE" $$
            nest 2 contents $$ "#+END_QUOTE" $$ blankline
 blockToOrg (Table caption' _ _ headers rows) =  do
@@ -150,11 +159,11 @@ blockToOrg (Table caption' _ _ headers rows) =  do
   headers' <- mapM blockListToOrg headers
   rawRows <- mapM (mapM blockListToOrg) rows
   let numChars = maximum . map offset
-  -- FIXME: width is not being used. 
+  -- FIXME: width is not being used.
   let widthsInChars =
        map ((+2) . numChars) $ transpose (headers' : rawRows)
-  -- FIXME: Org doesn't allow blocks with height more than 1. 
-  let hpipeBlocks blocks = hcat [beg, middle, end] 
+  -- FIXME: Org doesn't allow blocks with height more than 1.
+  let hpipeBlocks blocks = hcat [beg, middle, end]
         where h      = maximum (map height blocks)
               sep'   = lblock 3 $ vcat (map text $ replicate h " | ")
               beg    = lblock 2 $ vcat (map text $ replicate h "| ")
@@ -165,7 +174,7 @@ blockToOrg (Table caption' _ _ headers rows) =  do
   rows' <- mapM (\row -> do cols <- mapM blockListToOrg row
                             return $ makeRow cols) rows
   let border ch = char '|' <> char ch <>
-                  (hcat $ intersperse (char ch <> char '+' <> char ch) $ 
+                  (hcat $ intersperse (char ch <> char '+' <> char ch) $
                           map (\l -> text $ replicate l ch) widthsInChars) <>
                   char ch <> char '|'
   let body = vcat rows'
@@ -181,7 +190,7 @@ blockToOrg (OrderedList (start, _, delim) items) = do
   let delim' = case delim of
                     TwoParens -> OneParen
                     x         -> x
-  let markers = take (length items) $ orderedListMarkers 
+  let markers = take (length items) $ orderedListMarkers
                                       (start, Decimal, delim')
   let maxMarkerLength = maximum $ map length markers
   let markers' = map (\m -> let s = maxMarkerLength - length m
@@ -217,7 +226,7 @@ definitionListItemToOrg (label, defs) = do
 
 -- | Convert list of Pandoc block elements to Org.
 blockListToOrg :: [Block]       -- ^ List of block elements
-               -> State WriterState Doc 
+               -> State WriterState Doc
 blockListToOrg blocks = mapM blockToOrg blocks >>= return . vcat
 
 -- | Convert list of Pandoc inline elements to Org.
@@ -226,19 +235,19 @@ inlineListToOrg lst = mapM inlineToOrg lst >>= return . hcat
 
 -- | Convert Pandoc inline element to Org.
 inlineToOrg :: Inline -> State WriterState Doc
-inlineToOrg (Emph lst) = do 
+inlineToOrg (Emph lst) = do
   contents <- inlineListToOrg lst
   return $ "/" <> contents <> "/"
 inlineToOrg (Strong lst) = do
   contents <- inlineListToOrg lst
   return $ "*" <> contents <> "*"
-inlineToOrg (Strikeout lst) = do 
+inlineToOrg (Strikeout lst) = do
   contents <- inlineListToOrg lst
   return $ "+" <> contents <> "+"
-inlineToOrg (Superscript lst) = do 
+inlineToOrg (Superscript lst) = do
   contents <- inlineListToOrg lst
   return $ "^{" <> contents <> "}"
-inlineToOrg (Subscript lst) = do 
+inlineToOrg (Subscript lst) = do
   contents <- inlineListToOrg lst
   return $ "_{" <> contents <> "}"
 inlineToOrg (SmallCaps lst) = inlineListToOrg lst
@@ -249,10 +258,6 @@ inlineToOrg (Quoted DoubleQuote lst) = do
   contents <- inlineListToOrg lst
   return $ "\"" <> contents <> "\""
 inlineToOrg (Cite _  lst) = inlineListToOrg lst
-inlineToOrg EmDash = return "---"
-inlineToOrg EnDash = return "--"
-inlineToOrg Apostrophe = return "'"
-inlineToOrg Ellipses = return "..."
 inlineToOrg (Code _ str) = return $ "=" <> text str <> "="
 inlineToOrg (Str str) = return $ text $ escapeString str
 inlineToOrg (Math t str) = do
@@ -272,11 +277,10 @@ inlineToOrg (Link txt (src, _)) = do
         _ -> do contents <- inlineListToOrg txt
                 modify $ \s -> s{ stLinks = True }
                 return $ "[[" <> text src <> "][" <> contents <> "]]"
-inlineToOrg (Image _ (source', _)) = do
-  let source = unescapeURI source'
+inlineToOrg (Image _ (source, _)) = do
   modify $ \s -> s{ stImages = True }
   return $ "[[" <> text source <> "]]"
-inlineToOrg (Note contents) = do 
+inlineToOrg (Note contents) = do
   -- add to notes in state
   notes <- get >>= (return . stNotes)
   modify $ \st -> st { stNotes = contents:notes }

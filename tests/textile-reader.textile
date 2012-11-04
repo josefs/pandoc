@@ -70,6 +70,17 @@ bc. Code block with .bc
 
 Inline code: @<tt>@, <tt>@</tt>.
 
+h1. Notextile
+
+A block of text can be protected with notextile :
+
+<notextile>
+No *bold* and
+* no bullet
+</notextile>
+
+and inlines can be protected with ==double *equals (=)* markup==.
+
 h1. Lists
 
 h2. Unordered
@@ -79,6 +90,12 @@ Asterisks tight:
 * asterisk 1
 * asterisk 2
 * asterisk 3
+
+With line breaks:
+
+* asterisk 1
+newline
+* asterisk 2
 
 h2. Ordered
 
@@ -115,14 +132,15 @@ h1. Inline Markup
 
 This is _emphasized_, and so __is this__.
 This is *strong*, and so **is this**.
+Hyphenated-words-are-ok, as well as strange_underscore_notation.
 A "*strong link*":http://www.foobar.com.
 
 _*This is strong and em.*_
 So is *_this_* word and __**that one**__.
 -This is strikeout and *strong*-
 
-Superscripts:  a^bc^d a^*hello*^ a^hello there^.
-Subscripts: H~2~O, H~23~O, H~many of them~O.
+Superscripts: a[^bc^]d a^*hello*^ a[^hello there^].
+Subscripts: ~here~ H[~2~]O, H[~23~]O, H[~many of them~]O.
 
 Dashes : How cool -- automatic dashes.
 
@@ -140,6 +158,10 @@ Just a "url":http://www.url.com
 "Email link":mailto:nobody@nowhere.net
 
 Automatic linking to http://www.example.com and foobar@example.com.
+
+"Example":http://www.example.com/: Example of a link followed by a colon.
+
+A link["with brackets":http://www.example.com]and no spaces.
 
 h1. Tables
 
@@ -196,6 +218,17 @@ Html blocks can be <div>inlined</div> as well.
 
 Can you prove that 2 < 3 ?
 
+h1. Raw LaTeX
+
+This Textile reader also accepts raw LaTeX for blocks :
+
+\begin{itemize}
+  \item one
+  \item two
+\end{itemize}
+
+and for \emph{inlines}.
+
 h1. Acronyms and marks
 
 PBS(Public Broadcasting System)
@@ -210,7 +243,16 @@ Hi(c)2008 (C) 2008
 
 h1. Footnotes
 
-A note.[1]
+A note.[1]  Another note[2].
 
 fn1. The note
 is here!
+
+fn2. Other note.
+
+h1. Comment blocks
+
+###. my comment
+is here.
+
+not a comment.

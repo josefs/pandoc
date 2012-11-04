@@ -1,0 +1,115 @@
+{-# LANGUAGE OverloadedStrings, QuasiQuotes #-}
+module Tests.Readers.Markdown (tests) where
+
+import Text.Pandoc.Definition
+import Test.Framework
+import Tests.Helpers
+import Tests.Arbitrary()
+import Text.Pandoc.Builder
+import qualified Data.Set as Set
+-- import Text.Pandoc.Shared ( normalize )
+import Text.Pandoc
+
+markdown :: String -> Pandoc
+markdown = readMarkdown def
+
+markdownSmart :: String -> Pandoc
+markdownSmart = readMarkdown def { readerSmart = True }
+
+infix 4 =:
+(=:) :: ToString c
+     => String -> (String, c) -> Test
+(=:) = test markdown
+
+{-
+p_markdown_round_trip :: Block -> Bool
+p_markdown_round_trip b = matches d' d''
+  where d'  = normalize $ Pandoc (Meta [] [] []) [b]
+        d'' = normalize
+              $ readMarkdown def { readerSmart = True }
+              $ writeMarkdown def d'
+        matches (Pandoc _ [Plain []]) (Pandoc _ []) = True
+        matches (Pandoc _ [Para []]) (Pandoc _ []) = True
+        matches (Pandoc _ [Plain xs]) (Pandoc _ [Para xs']) = xs == xs'
+        matches x y = x == y
+-}
+
+tests :: [Test]
+tests = [ testGroup "inline code"
+          [ "with attribute" =:
+            "`document.write(\"Hello\");`{.javascript}"
+            =?> para
+                (codeWith ("",["javascript"],[]) "document.write(\"Hello\");")
+          , "with attribute space" =:
+            "`*` {.haskell .special x=\"7\"}"
+            =?> para (codeWith ("",["haskell","special"],[("x","7")]) "*")
+          ]
+        , testGroup "raw LaTeX"
+          [ "in URL" =:
+            "\\begin\n" =?> para (text "\\begin")
+          ]
+        , "unbalanced brackets" =:
+            "[[[[[[[[[[[[[[[hi" =?> para (text "[[[[[[[[[[[[[[[hi")
+        , testGroup "backslash escapes"
+          [ "in URL" =:
+            "[hi](/there\\))"
+            =?> para (link "/there)" "" "hi")
+          , "in title" =:
+            "[hi](/there \"a\\\"a\")"
+            =?> para (link "/there" "a\"a" "hi")
+          , "in reference link title" =:
+            "[hi]\n\n[hi]: /there (a\\)a)"
+            =?> para (link "/there" "a)a" "hi")
+          , "in reference link URL" =:
+            "[hi]\n\n[hi]: /there\\.0"
+            =?> para (link "/there.0" "" "hi")
+          ]
+        , testGroup "smart punctuation"
+          [ test markdownSmart "quote before ellipses"
+            ("'...hi'"
+            =?> para (singleQuoted ("…hi")))
+          , test markdownSmart "apostrophe before emph"
+            ("D'oh! A l'*aide*!"
+            =?> para ("D’oh! A l’" <> emph "aide" <> "!"))
+          , test markdownSmart "apostrophe in French"
+            ("À l'arrivée de la guerre, le thème de l'«impossibilité du socialisme»"
+            =?> para ("À l’arrivée de la guerre, le thème de l’«impossibilité du socialisme»"))
+          ]
+        , testGroup "mixed emphasis and strong"
+          [ "emph and strong emph alternating" =:
+            "*xxx* ***xxx*** xxx\n*xxx* ***xxx*** xxx"
+            =?> para (emph "xxx" <> space <> strong (emph "xxx") <>
+                      space <> "xxx" <> space <>
+                      emph "xxx" <> space <> strong (emph "xxx") <>
+                      space <> "xxx")
+          , "emph with spaced strong" =:
+            "*x **xx** x*"
+            =?> para (emph ("x" <> space <> strong "xx" <> space <> "x"))
+          ]
+        , testGroup "footnotes"
+          [ "indent followed by newline and flush-left text" =:
+            "[^1]\n\n[^1]: my note\n\n     \nnot in note\n"
+            =?> para (note (para "my note")) <> para "not in note"
+          , "indent followed by newline and indented text" =:
+            "[^1]\n\n[^1]: my note\n     \n    in note\n"
+            =?> para (note (para "my note" <> para "in note"))
+          , "recursive note" =:
+            "[^1]\n\n[^1]: See [^1]\n"
+            =?> para (note (para "See [^1]"))
+          ]
+        , testGroup "lhs"
+          [ test (readMarkdown def{ readerExtensions = Set.insert
+                       Ext_literate_haskell $ readerExtensions def })
+              "inverse bird tracks and html" $
+              "> a\n\n< b\n\n<div>\n"
+              =?> codeBlockWith ("",["sourceCode","literate","haskell"],[]) "a"
+                  <>
+                  codeBlockWith ("",["sourceCode","haskell"],[]) "b"
+                  <>
+                  rawBlock "html" "<div>\n\n"
+          ]
+-- the round-trip properties frequently fail
+--        , testGroup "round trip"
+--          [ property "p_markdown_round_trip" p_markdown_round_trip
+--          ]
+        ]

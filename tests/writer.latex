@@ -1,20 +1,22 @@
-\documentclass{article}
+\documentclass[]{article}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
 \usepackage{amssymb,amsmath}
-\usepackage[mathletters]{ucs}
-\usepackage[utf8x]{inputenc}
+\usepackage{ifxetex,ifluatex}
+\usepackage{fixltx2e} % provides \textsubscript
+% use microtype if available
+\IfFileExists{microtype.sty}{\usepackage{microtype}}{}
+\ifnum 0\ifxetex 1\fi\ifluatex 1\fi=0 % if pdftex
+  \usepackage[utf8]{inputenc}
+\else % if luatex or xelatex
+  \usepackage{fontspec}
+  \ifxetex
+    \usepackage{xltxtra,xunicode}
+  \fi
+  \defaultfontfeatures{Mapping=tex-text,Scale=MatchLowercase}
+  \newcommand{\euro}{€}
+\fi
 \usepackage{fancyvrb}
-% Redefine labelwidth for lists; otherwise, the enumerate package will cause
-% markers to extend beyond the left margin.
-\makeatletter\AtBeginDocument{%
-  \renewcommand{\@listi}
-    {\setlength{\labelwidth}{4em}}
-}\makeatother
-\usepackage{enumerate}
-\usepackage[normalem]{ulem}
-% avoid problems with \sout in headers with hyperref:
-\pdfstringdefDisableCommands{\renewcommand{\sout}{}}
-\newcommand{\textsubscr}[1]{\ensuremath{_{\scriptsize\textrm{#1}}}}
-\usepackage{url}
 \usepackage{graphicx}
 % We will generate all images so they have a width \maxwidth. This means
 % that they will get their normal width if they fit onto the page, but
@@ -25,14 +27,32 @@
 \makeatother
 \let\Oldincludegraphics\includegraphics
 \renewcommand{\includegraphics}[1]{\Oldincludegraphics[width=\maxwidth]{#1}}
-\usepackage[breaklinks=true,unicode=true,pdfborder={0 0 0}]{hyperref}
+\ifxetex
+  \usepackage[setpagesize=false, % page size defined by xetex
+              unicode=false, % unicode breaks when used with xetex
+              xetex]{hyperref}
+\else
+  \usepackage[unicode=true]{hyperref}
+\fi
+\hypersetup{breaklinks=true,
+            bookmarks=true,
+            pdfauthor={John MacFarlane; Anonymous},
+            pdftitle={Pandoc Test Suite},
+            colorlinks=true,
+            urlcolor=blue,
+            linkcolor=magenta,
+            pdfborder={0 0 0}}
+\usepackage[normalem]{ulem}
+% avoid problems with \sout in headers with hyperref:
+\pdfstringdefDisableCommands{\renewcommand{\sout}{}}
 \setlength{\parindent}{0pt}
 \setlength{\parskip}{6pt plus 2pt minus 1pt}
+\setlength{\emergencystretch}{3em}  % prevent overfull lines
 \setcounter{secnumdepth}{0}
 \VerbatimFootnotes % allows verbatim text in footnotes
 
 \title{Pandoc Test Suite}
-\author{John MacFarlane\\Anonymous}
+\author{John MacFarlane \and Anonymous}
 \date{July 17, 2006}
 
 \begin{document}
@@ -87,8 +107,8 @@ E-mail style:
 
 \begin{quote}
 This is a block quote. It is pretty short.
-
 \end{quote}
+
 \begin{quote}
 Code in a block quote:
 
@@ -97,25 +117,28 @@ sub status {
     print "working";
 }
 \end{verbatim}
+
 A list:
 
-\begin{enumerate}[1.]
+\begin{enumerate}
+\def\labelenumi{\arabic{enumi}.}
 \item
   item one
 \item
   item two
 \end{enumerate}
+
 Nested block quotes:
 
 \begin{quote}
 nested
-
 \end{quote}
+
 \begin{quote}
 nested
+\end{quote}
+\end{quote}
 
-\end{quote}
-\end{quote}
 This should not be a block quote: 2 \textgreater{} 1.
 
 And a following paragraph.
@@ -135,6 +158,7 @@ sub status {
 
 this code block is indented by one tab
 \end{verbatim}
+
 And:
 
 \begin{verbatim}
@@ -142,6 +166,7 @@ And:
 
 These should not be escaped:  \$ \\ \> \[ \{
 \end{verbatim}
+
 \begin{center}\rule{3in}{0.4pt}\end{center}
 
 \section{Lists}
@@ -158,6 +183,7 @@ Asterisks tight:
 \item
   asterisk 3
 \end{itemize}
+
 Asterisks loose:
 
 \begin{itemize}
@@ -168,6 +194,7 @@ Asterisks loose:
 \item
   asterisk 3
 \end{itemize}
+
 Pluses tight:
 
 \begin{itemize}
@@ -178,6 +205,7 @@ Pluses tight:
 \item
   Plus 3
 \end{itemize}
+
 Pluses loose:
 
 \begin{itemize}
@@ -188,6 +216,7 @@ Pluses loose:
 \item
   Plus 3
 \end{itemize}
+
 Minuses tight:
 
 \begin{itemize}
@@ -198,6 +227,7 @@ Minuses tight:
 \item
   Minus 3
 \end{itemize}
+
 Minuses loose:
 
 \begin{itemize}
@@ -208,11 +238,13 @@ Minuses loose:
 \item
   Minus 3
 \end{itemize}
+
 \subsection{Ordered}
 
 Tight:
 
-\begin{enumerate}[1.]
+\begin{enumerate}
+\def\labelenumi{\arabic{enumi}.}
 \item
   First
 \item
@@ -220,9 +252,11 @@ Tight:
 \item
   Third
 \end{enumerate}
+
 and:
 
-\begin{enumerate}[1.]
+\begin{enumerate}
+\def\labelenumi{\arabic{enumi}.}
 \item
   One
 \item
@@ -230,9 +264,11 @@ and:
 \item
   Three
 \end{enumerate}
+
 Loose using tabs:
 
-\begin{enumerate}[1.]
+\begin{enumerate}
+\def\labelenumi{\arabic{enumi}.}
 \item
   First
 \item
@@ -240,9 +276,11 @@ Loose using tabs:
 \item
   Third
 \end{enumerate}
+
 and using spaces:
 
-\begin{enumerate}[1.]
+\begin{enumerate}
+\def\labelenumi{\arabic{enumi}.}
 \item
   One
 \item
@@ -250,9 +288,11 @@ and using spaces:
 \item
   Three
 \end{enumerate}
+
 Multiple paragraphs:
 
-\begin{enumerate}[1.]
+\begin{enumerate}
+\def\labelenumi{\arabic{enumi}.}
 \item
   Item 1, graf one.
 
@@ -262,27 +302,33 @@ Multiple paragraphs:
 \item
   Item 3.
 \end{enumerate}
+
 \subsection{Nested}
 
 \begin{itemize}
 \item
   Tab
+
   \begin{itemize}
   \item
     Tab
+
     \begin{itemize}
     \item
       Tab
     \end{itemize}
   \end{itemize}
 \end{itemize}
+
 Here's another:
 
-\begin{enumerate}[1.]
+\begin{enumerate}
+\def\labelenumi{\arabic{enumi}.}
 \item
   First
 \item
   Second:
+
   \begin{itemize}
   \item
     Fee
@@ -294,9 +340,11 @@ Here's another:
 \item
   Third
 \end{enumerate}
+
 Same thing but with paragraphs:
 
-\begin{enumerate}[1.]
+\begin{enumerate}
+\def\labelenumi{\arabic{enumi}.}
 \item
   First
 \item
@@ -313,6 +361,7 @@ Same thing but with paragraphs:
 \item
   Third
 \end{enumerate}
+
 \subsection{Tabs and spaces}
 
 \begin{itemize}
@@ -328,9 +377,11 @@ Same thing but with paragraphs:
     this is an example list item indented with spaces
   \end{itemize}
 \end{itemize}
+
 \subsection{Fancy list markers}
 
-\begin{enumerate}[(1)]
+\begin{enumerate}
+\def\labelenumi{(\arabic{enumi})}
 \setcounter{enumi}{1}
 \item
   begins with 2
@@ -339,13 +390,16 @@ Same thing but with paragraphs:
 
   with a continuation
 
-  \begin{enumerate}[i.]
+  \begin{enumerate}
+  \def\labelenumii{\roman{enumii}.}
   \setcounter{enumii}{3}
   \item
     sublist with roman numerals, starting with 4
   \item
     more items
-    \begin{enumerate}[(A)]
+
+    \begin{enumerate}
+    \def\labelenumiii{(\Alph{enumiii})}
     \item
       a subsublist
     \item
@@ -353,19 +407,27 @@ Same thing but with paragraphs:
     \end{enumerate}
   \end{enumerate}
 \end{enumerate}
+
 Nesting:
 
-\begin{enumerate}[A.]
+\begin{enumerate}
+\def\labelenumi{\Alph{enumi}.}
 \item
   Upper Alpha
-  \begin{enumerate}[I.]
+
+  \begin{enumerate}
+  \def\labelenumii{\Roman{enumii}.}
   \item
     Upper Roman.
-    \begin{enumerate}[(1)]
+
+    \begin{enumerate}
+    \def\labelenumiii{(\arabic{enumiii})}
     \setcounter{enumiii}{5}
     \item
       Decimal start with 6
-      \begin{enumerate}[a)]
+
+      \begin{enumerate}
+      \def\labelenumiv{\alph{enumiv})}
       \setcounter{enumiv}{2}
       \item
         Lower alpha with paren
@@ -373,6 +435,7 @@ Nesting:
     \end{enumerate}
   \end{enumerate}
 \end{enumerate}
+
 Autonumbering:
 
 \begin{enumerate}
@@ -380,11 +443,13 @@ Autonumbering:
   Autonumber.
 \item
   More.
+
   \begin{enumerate}
   \item
     Nested.
   \end{enumerate}
 \end{enumerate}
+
 Should not be a list item:
 
 M.A.~2007
@@ -405,6 +470,7 @@ orange fruit
 \item[banana]
 yellow fruit
 \end{description}
+
 Tight using tabs:
 
 \begin{description}
@@ -415,19 +481,18 @@ orange fruit
 \item[banana]
 yellow fruit
 \end{description}
+
 Loose:
 
 \begin{description}
 \item[apple]
 red fruit
-
 \item[orange]
 orange fruit
-
 \item[banana]
 yellow fruit
-
 \end{description}
+
 Multiple blocks with italics:
 
 \begin{description}
@@ -435,18 +500,18 @@ Multiple blocks with italics:
 red fruit
 
 contains seeds, crisp, pleasant to taste
-
 \item[\emph{orange}]
 orange fruit
 
 \begin{verbatim}
 { orange code block }
 \end{verbatim}
+
 \begin{quote}
 orange block quote
-
 \end{quote}
 \end{description}
+
 Multiple definitions, tight:
 
 \begin{description}
@@ -459,6 +524,7 @@ orange fruit
 
 bank
 \end{description}
+
 Multiple definitions, loose:
 
 \begin{description}
@@ -466,13 +532,12 @@ Multiple definitions, loose:
 red fruit
 
 computer
-
 \item[orange]
 orange fruit
 
 bank
-
 \end{description}
+
 Blank line after term, indented marker, alternate markers:
 
 \begin{description}
@@ -480,33 +545,40 @@ Blank line after term, indented marker, alternate markers:
 red fruit
 
 computer
-
 \item[orange]
 orange fruit
 
-\begin{enumerate}[1.]
+\begin{enumerate}
+\def\labelenumi{\arabic{enumi}.}
 \item
   sublist
 \item
   sublist
 \end{enumerate}
 \end{description}
+
 \section{HTML Blocks}
 
 Simple block on one line:
 
 foo
+
 And nested without indentation:
 
 foo
+
 bar
+
 Interpreted markdown in a table:
 
 This is \emph{emphasized}
+
 And this is \textbf{strong}
+
 Here's a simple block:
 
 foo
+
 This should be a code block, though:
 
 \begin{verbatim}
@@ -514,14 +586,17 @@ This should be a code block, though:
     foo
 </div>
 \end{verbatim}
+
 As should this:
 
 \begin{verbatim}
 <div>foo</div>
 \end{verbatim}
+
 Now, nested:
 
 foo
+
 This should just be an HTML comment:
 
 Multiline:
@@ -531,6 +606,7 @@ Code block:
 \begin{verbatim}
 <!-- Comment -->
 \end{verbatim}
+
 Just plain comment, with trailing spaces on the line:
 
 Code:
@@ -538,6 +614,7 @@ Code:
 \begin{verbatim}
 <hr />
 \end{verbatim}
+
 Hr's:
 
 \begin{center}\rule{3in}{0.4pt}\end{center}
@@ -558,17 +635,19 @@ So is \textbf{\emph{this}} word.
 
 So is \textbf{\emph{this}} word.
 
-This is code: \verb!>!, \verb!$!, \verb!\!, \verb!\$!, \verb!<html>!.
+This is code: \texttt{\textgreater{}}, \texttt{\$}, \texttt{\textbackslash{}},
+\texttt{\textbackslash{}\$}, \texttt{\textless{}html\textgreater{}}.
 
 \sout{This is \emph{strikeout}.}
 
 Superscripts: a\textsuperscript{bc}d a\textsuperscript{\emph{hello}}
 a\textsuperscript{hello~there}.
 
-Subscripts: H\textsubscr{2}O, H\textsubscr{23}O, H\textsubscr{many~of~them}O.
+Subscripts: H\textsubscript{2}O, H\textsubscript{23}O,
+H\textsubscript{many~of~them}O.
 
 These should not be superscripts or subscripts, because of the unescaped
-spaces: a\^{}b c\^{}d, a\ensuremath{\sim}b c\ensuremath{\sim}d.
+spaces: a\^{}b c\^{}d, a\textasciitilde{}b c\textasciitilde{}d.
 
 \begin{center}\rule{3in}{0.4pt}\end{center}
 
@@ -582,7 +661,7 @@ spaces: a\^{}b c\^{}d, a\ensuremath{\sim}b c\ensuremath{\sim}d.
 
 `He said, ``I want to go.''\,' Were you alive in the 70's?
 
-Here is some quoted `\verb!code!' and a
+Here is some quoted `\texttt{code}' and a
 ``\href{http://example.com/?foo=1\&bar=2}{quoted link}''.
 
 Some dashes: one---two --- three---four --- five.
@@ -614,19 +693,21 @@ Ellipses\ldots{}and\ldots{}and\ldots{}.
 \item
   Here's one that has a line break in it: $\alpha + \omega \times x^2$.
 \end{itemize}
+
 These shouldn't be math:
 
 \begin{itemize}
 \item
-  To get the famous equation, write \verb!$e = mc^2$!.
+  To get the famous equation, write \texttt{\$e = mc\^{}2\$}.
 \item
   \$22,000 is a \emph{lot} of money. So is \$34,000. (It worked if ``lot'' is
   emphasized.)
 \item
   Shoes (\$20) and socks (\$5).
 \item
-  Escaped \verb!$!: \$73 \emph{this should be emphasized} 23\$.
+  Escaped \texttt{\$}: \$73 \emph{this should be emphasized} 23\$.
 \end{itemize}
+
 Here's a LaTeX table:
 
 \begin{tabular}{|l|l|}\hline
@@ -653,6 +734,7 @@ Here is some unicode:
 \item
   copyright: ©
 \end{itemize}
+
 AT\&T has an ampersand in their name.
 
 AT\&T is another way to write it.
@@ -713,7 +795,7 @@ Just a \href{/url/}{URL}.
 
 \href{/url/}{URL and title}
 
-\href{/url/with\_underscore}{with\_underscore}
+\href{/url/with_underscore}{with\_underscore}
 
 \href{mailto:nobody@nowhere.net}{Email link}
 
@@ -742,6 +824,7 @@ This should {[}not{]}{[}{]} be a link.
 \begin{verbatim}
 [not]: /url
 \end{verbatim}
+
 Foo \href{/url/}{bar}.
 
 Foo \href{/url/}{biz}.
@@ -760,7 +843,7 @@ Here's an \href{/script?foo=1\&bar=2}{inline link in pointy braces}.
 
 \subsection{Autolinks}
 
-With an ampersand: \url{http://example.com/?foo=1&bar=2}
+With an ampersand: \url{http://example.com/?foo=1\&bar=2}
 
 \begin{itemize}
 \item
@@ -770,25 +853,28 @@ With an ampersand: \url{http://example.com/?foo=1&bar=2}
 \item
   It should.
 \end{itemize}
+
 An e-mail address:
 \href{mailto:nobody@nowhere.net}{\texttt{nobody@nowhere.net}}
 
 \begin{quote}
 Blockquoted: \url{http://example.com/}
-
 \end{quote}
-Auto-links should not occur here: \verb!<http://example.com/>!
+
+Auto-links should not occur here:
+\texttt{\textless{}http://example.com/\textgreater{}}
 
 \begin{verbatim}
 or here: <http://example.com/>
 \end{verbatim}
+
 \begin{center}\rule{3in}{0.4pt}\end{center}
 
 \section{Images}
 
 From ``Voyage dans la Lune'' by Georges Melies (1902):
 
-\begin{figure}[htb]
+\begin{figure}[htbp]
 \centering
 \includegraphics{lalune.jpg}
 \caption{lalune}
@@ -808,24 +894,27 @@ Here is a footnote reference,\footnote{Here is the footnote. It can go
   Subsequent blocks are indented to show that they belong to the footnote (as
   with list items).
 
-  \begin{Verbatim}
+\begin{Verbatim}
   { <code> }
-  \end{Verbatim}
+\end{Verbatim}
+
   If you want, you can indent every line, but you can also be lazy and just
   indent the first line of each block.} This should \emph{not} be a footnote
 reference, because it contains a space.{[}\^{}my note{]} Here is an inline
 note.\footnote{This is \emph{easier} to type. Inline notes may contain
-  \href{http://google.com}{links} and \verb!]! verbatim characters, as well as
-  {[}bracketed text{]}.}
+  \href{http://google.com}{links} and \texttt{{]}} verbatim characters, as
+  well as {[}bracketed text{]}.}
 
 \begin{quote}
 Notes can go in quotes.\footnote{In quote.}
-
 \end{quote}
-\begin{enumerate}[1.]
+
+\begin{enumerate}
+\def\labelenumi{\arabic{enumi}.}
 \item
   And in list items.\footnote{In list.}
 \end{enumerate}
+
 This paragraph should not be part of the note, as it is not indented.
 
 \end{document}

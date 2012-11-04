@@ -19,16 +19,17 @@ Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
 {- |
    Module      : Text.Pandoc.Writers.Texinfo
    Copyright   : Copyright (C) 2008-2010 John MacFarlane and Peter Wang
-   License     : GNU GPL, version 2 or above 
+   License     : GNU GPL, version 2 or above
 
    Maintainer  : John MacFarlane <jgm@berkeley.edu>
-   Stability   : alpha 
+   Stability   : alpha
    Portability : portable
 
 Conversion of 'Pandoc' format into Texinfo.
 -}
 module Text.Pandoc.Writers.Texinfo ( writeTexinfo ) where
 import Text.Pandoc.Definition
+import Text.Pandoc.Options
 import Text.Pandoc.Shared
 import Text.Pandoc.Templates (renderTemplate)
 import Text.Printf ( printf )
@@ -37,11 +38,15 @@ import Data.Ord ( comparing )
 import Data.Char ( chr, ord )
 import Control.Monad.State
 import Text.Pandoc.Pretty
+import Network.URI ( isAbsoluteURI, unEscapeString )
+import System.FilePath
 
-data WriterState = 
+data WriterState =
   WriterState { stStrikeout   :: Bool  -- document contains strikeout
               , stSuperscript :: Bool -- document contains superscript
               , stSubscript   :: Bool -- document contains subscript
+              , stEscapeComma :: Bool -- in a context where we need @comma
+              , stIdentifiers :: [String] -- header ids used already
               }
 
 {- TODO:
@@ -51,9 +56,10 @@ data WriterState =
 
 -- | Convert Pandoc to Texinfo.
 writeTexinfo :: WriterOptions -> Pandoc -> String
-writeTexinfo options document = 
-  evalState (pandocToTexinfo options $ wrapTop document) $ 
-  WriterState { stStrikeout = False, stSuperscript = False, stSubscript = False }
+writeTexinfo options document =
+  evalState (pandocToTexinfo options $ wrapTop document) $
+  WriterState { stStrikeout = False, stSuperscript = False,
+                stEscapeComma = False, stSubscript = False, stIdentifiers = [] }
 
 -- | Add a "Top" node around the document, needed by Texinfo.
 wrapTop :: Pandoc -> Pandoc
@@ -92,9 +98,20 @@ stringToTexinfo = escapeStringUsing texinfoEscapes
   where texinfoEscapes = [ ('{', "@{")
                          , ('}', "@}")
                          , ('@', "@@")
-                         , (',', "@comma{}") -- only needed in argument lists
                          , ('\160', "@ ")
+                         , ('\x2014', "---")
+                         , ('\x2013', "--")
+                         , ('\x2026', "@dots{}")
+                         , ('\x2019', "'")
                          ]
+
+escapeCommas :: State WriterState Doc -> State WriterState Doc
+escapeCommas parser = do
+  oldEscapeComma <- gets stEscapeComma
+  modify $ \st -> st{ stEscapeComma = True }
+  res <- parser
+  modify $ \st -> st{ stEscapeComma = oldEscapeComma }
+  return res
 
 -- | Puts contents into Texinfo command.
 inCmd :: String -> Doc -> Doc
@@ -110,10 +127,12 @@ blockToTexinfo (Plain lst) =
   inlineListToTexinfo lst
 
 blockToTexinfo (Para [Image txt (src,tit)]) = do
-  capt <- inlineListToTexinfo txt
+  capt <- if null txt
+             then return empty
+             else (\c -> text "@caption" <> braces c) `fmap`
+                    inlineListToTexinfo txt
   img  <- inlineToTexinfo (Image txt (src,tit))
-  return $ text "@float" $$ img $$ (text "@caption{" <> capt <> char '}') $$
-           text "@end float"
+  return $ text "@float" $$ img $$ capt $$ text "@end float"
 
 blockToTexinfo (Para lst) =
   inlineListToTexinfo lst    -- this is handled differently from Plain in blockListToTexinfo
@@ -125,7 +144,8 @@ blockToTexinfo (BlockQuote lst) = do
            text "@end quotation"
 
 blockToTexinfo (CodeBlock _ str) = do
-  return $ text "@verbatim" $$
+  return $ blankline $$
+           text "@verbatim" $$
            flush (text str) $$
            text "@end verbatim" <> blankline
 
@@ -185,9 +205,13 @@ blockToTexinfo (Header 0 lst) = do
 blockToTexinfo (Header level lst) = do
   node <- inlineListForNode lst
   txt <- inlineListToTexinfo lst
+  idsUsed <- gets stIdentifiers
+  let id' = uniqueIdent lst idsUsed
+  modify $ \st -> st{ stIdentifiers = id' : idsUsed }
   return $ if (level > 0) && (level <= 4)
-              then blankline <> text "@node " <> node <> cr <>
-                   text (seccmd level) <> txt
+              then blankline <> text "@node " <> node $$
+                   text (seccmd level) <> txt $$
+                   text "@anchor" <> braces (text $ '#':id')
               else txt
   where
     seccmd 1 = "@chapter "
@@ -211,7 +235,7 @@ blockToTexinfo (Table caption aligns widths heads rows) = do
        else return $ "@columnfractions " ++ concatMap (printf "%.2f ") widths
   let tableBody = text ("@multitable " ++ colDescriptors) $$
                   headers $$
-                  vcat rowsText $$ 
+                  vcat rowsText $$
                   text "@end multitable"
   return $ if isEmpty captionText
               then tableBody <> blankline
@@ -235,7 +259,7 @@ tableAnyRowToTexinfo :: String
                      -> [[Block]]
                      -> State WriterState Doc
 tableAnyRowToTexinfo itemtype aligns cols =
-  zipWithM alignedBlock aligns cols >>= 
+  zipWithM alignedBlock aligns cols >>=
   return . (text itemtype $$) . foldl (\row item -> row $$
   (if isEmpty row then empty else text " @tab ") <> item) empty
 
@@ -338,7 +362,8 @@ inlineListToTexinfo lst = mapM inlineToTexinfo lst >>= return . hcat
 -- | Convert list of inline elements to Texinfo acceptable for a node name.
 inlineListForNode :: [Inline]  -- ^ Inlines to convert
                   -> State WriterState Doc
-inlineListForNode = return . text . filter (not . disallowedInNode) . stringify
+inlineListForNode = return . text . stringToTexinfo .
+                    filter (not . disallowedInNode) . stringify
 
 -- periods, commas, colons, and parentheses are disallowed in node names
 disallowedInNode :: Char -> Bool
@@ -351,8 +376,8 @@ inlineToTexinfo :: Inline    -- ^ Inline to convert
 inlineToTexinfo (Emph lst) =
   inlineListToTexinfo lst >>= return . inCmd "emph"
 
-inlineToTexinfo (Strong lst) = 
-  inlineListToTexinfo lst >>= return . inCmd "strong" 
+inlineToTexinfo (Strong lst) =
+  inlineListToTexinfo lst >>= return . inCmd "strong"
 
 inlineToTexinfo (Strikeout lst) = do
   modify $ \st -> st{ stStrikeout = True }
@@ -385,10 +410,6 @@ inlineToTexinfo (Quoted DoubleQuote lst) = do
 
 inlineToTexinfo (Cite _ lst) =
   inlineListToTexinfo lst
-inlineToTexinfo Apostrophe = return $ char '\''
-inlineToTexinfo EmDash = return $ text "---"
-inlineToTexinfo EnDash = return $ text "--"
-inlineToTexinfo Ellipses = return $ text "@dots{}"
 inlineToTexinfo (Str str) = return $ text (stringToTexinfo str)
 inlineToTexinfo (Math _ str) = return $ inCmd "math" $ text str
 inlineToTexinfo (RawInline f str) | f == "latex" || f == "tex" =
@@ -398,25 +419,29 @@ inlineToTexinfo (RawInline _ _) = return empty
 inlineToTexinfo (LineBreak) = return $ text "@*"
 inlineToTexinfo Space = return $ char ' '
 
+inlineToTexinfo (Link txt (src@('#':_), _)) = do
+  contents <- escapeCommas $ inlineListToTexinfo txt
+  return $ text "@ref" <>
+           braces (text (stringToTexinfo src) <> text "," <> contents)
 inlineToTexinfo (Link txt (src, _)) = do
   case txt of
         [Code _ x] | x == src ->  -- autolink
              do return $ text $ "@url{" ++ x ++ "}"
-        _ -> do contents <- inlineListToTexinfo txt
+        _ -> do contents <- escapeCommas $ inlineListToTexinfo txt
                 let src1 = stringToTexinfo src
                 return $ text ("@uref{" ++ src1 ++ ",") <> contents <>
                          char '}'
 
 inlineToTexinfo (Image alternate (source, _)) = do
-  content <- inlineListToTexinfo alternate
+  content <- escapeCommas $ inlineListToTexinfo alternate
   return $ text ("@image{" ++ base ++ ",,,") <> content <> text "," <>
            text (ext ++ "}")
   where
-    (revext, revbase) = break (=='.') (reverse source)
-    ext  = reverse revext
-    base = case revbase of
-            ('.' : rest) -> reverse rest
-            _            -> reverse revbase
+    ext     = drop 1 $ takeExtension source'
+    base    = dropExtension source'
+    source' = if isAbsoluteURI source
+                 then source
+                 else unEscapeString source
 
 inlineToTexinfo (Note contents) = do
   contents' <- blockListToTexinfo contents

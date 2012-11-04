@@ -19,7 +19,7 @@ Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
 {- |
    Module      : Text.Pandoc.Writers.Textile
    Copyright   : Copyright (C) 2010 John MacFarlane
-   License     : GNU GPL, version 2 or above 
+   License     : GNU GPL, version 2 or above
 
    Maintainer  : John MacFarlane <jgm@berkeley.edu>
    Stability   : alpha
@@ -31,7 +31,8 @@ Textile:  <http://thresholdstate.com/articles/4312/the-textile-reference-manual>
 -}
 module Text.Pandoc.Writers.Textile ( writeTextile ) where
 import Text.Pandoc.Definition
-import Text.Pandoc.Shared 
+import Text.Pandoc.Options
+import Text.Pandoc.Shared
 import Text.Pandoc.Templates (renderTemplate)
 import Text.Pandoc.XML ( escapeStringForXML )
 import Data.List ( intercalate )
@@ -46,9 +47,9 @@ data WriterState = WriterState {
 
 -- | Convert Pandoc to Textile.
 writeTextile :: WriterOptions -> Pandoc -> String
-writeTextile opts document = 
-  evalState (pandocToTextile opts document) 
-            (WriterState { stNotes = [], stListLevel = [], stUseTags = False }) 
+writeTextile opts document =
+  evalState (pandocToTextile opts document)
+            (WriterState { stNotes = [], stListLevel = [], stUseTags = False })
 
 -- | Return Textile representation of document.
 pandocToTextile :: WriterOptions -> Pandoc -> State WriterState String
@@ -72,28 +73,32 @@ withUseTags action = do
 -- | Escape one character as needed for Textile.
 escapeCharForTextile :: Char -> String
 escapeCharForTextile x = case x of
-                         '&'    -> "&amp;"
-                         '<'    -> "&lt;"
-                         '>'    -> "&gt;"
-                         '"'    -> "&quot;"
-                         '*'    -> "&#42;"
-                         '_'    -> "&#95;"
-                         '@'    -> "&#64;"
-                         '|'    -> "&#124;"
-                         c      -> [c]
+                         '&'      -> "&amp;"
+                         '<'      -> "&lt;"
+                         '>'      -> "&gt;"
+                         '"'      -> "&quot;"
+                         '*'      -> "&#42;"
+                         '_'      -> "&#95;"
+                         '@'      -> "&#64;"
+                         '|'      -> "&#124;"
+                         '\x2014' -> " -- "
+                         '\x2013' -> " - "
+                         '\x2019' -> "'"
+                         '\x2026' -> "..."
+                         c        -> [c]
 
 -- | Escape string as needed for Textile.
 escapeStringForTextile :: String -> String
 escapeStringForTextile = concatMap escapeCharForTextile
 
--- | Convert Pandoc block element to Textile. 
+-- | Convert Pandoc block element to Textile.
 blockToTextile :: WriterOptions -- ^ Options
                 -> Block         -- ^ Block element
-                -> State WriterState String 
+                -> State WriterState String
 
 blockToTextile _ Null = return ""
 
-blockToTextile opts (Plain inlines) = 
+blockToTextile opts (Plain inlines) =
   inlineListToTextile opts inlines
 
 blockToTextile opts (Para [Image txt (src,tit)]) = do
@@ -232,7 +237,7 @@ listItemToTextile opts items = do
 
 -- | Convert definition list item (label, list of blocks) to Textile.
 definitionListItemToTextile :: WriterOptions
-                             -> ([Inline],[[Block]]) 
+                             -> ([Inline],[[Block]])
                              -> State WriterState String
 definitionListItemToTextile opts (label, items) = do
   labelText <- inlineListToTextile opts label
@@ -290,8 +295,8 @@ tableRowToTextile opts alignStrings rownum cols' = do
                       0                  -> "header"
                       x | x `rem` 2 == 1 -> "odd"
                       _                  -> "even"
-  cols'' <- sequence $ zipWith 
-            (\alignment item -> tableItemToTextile opts celltype alignment item) 
+  cols'' <- sequence $ zipWith
+            (\alignment item -> tableItemToTextile opts celltype alignment item)
             alignStrings cols'
   return $ "<tr class=\"" ++ rowclass ++ "\">\n" ++ unlines cols'' ++ "</tr>"
 
@@ -316,7 +321,7 @@ tableItemToTextile opts celltype align' item = do
 -- | Convert list of Pandoc block elements to Textile.
 blockListToTextile :: WriterOptions -- ^ Options
                     -> [Block]       -- ^ List of block elements
-                    -> State WriterState String 
+                    -> State WriterState String
 blockListToTextile opts blocks =
   mapM (blockToTextile opts) blocks >>= return . vcat
 
@@ -328,11 +333,11 @@ inlineListToTextile opts lst =
 -- | Convert Pandoc inline element to Textile.
 inlineToTextile :: WriterOptions -> Inline -> State WriterState String
 
-inlineToTextile opts (Emph lst) = do 
+inlineToTextile opts (Emph lst) = do
   contents <- inlineListToTextile opts lst
   return $ if '_' `elem` contents
               then "<em>" ++ contents ++ "</em>"
-              else "_" ++ contents ++ "_" 
+              else "_" ++ contents ++ "_"
 
 inlineToTextile opts (Strong lst) = do
   contents <- inlineListToTextile opts lst
@@ -370,18 +375,10 @@ inlineToTextile opts (Quoted DoubleQuote lst) = do
 
 inlineToTextile opts (Cite _  lst) = inlineListToTextile opts lst
 
-inlineToTextile _ EmDash = return " -- "
-
-inlineToTextile _ EnDash = return " - "
-
-inlineToTextile _ Apostrophe = return "'"
-
-inlineToTextile _ Ellipses = return "..."
-
 inlineToTextile _ (Code _ str) =
   return $ if '@' `elem` str
            then "<tt>" ++ escapeStringForXML str ++ "</tt>"
-           else "@" ++ str ++ "@" 
+           else "@" ++ str ++ "@"
 
 inlineToTextile _ (Str str) = return $ escapeStringForTextile str
 
