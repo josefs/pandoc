@@ -1,5 +1,7 @@
+{-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE FlexibleContexts #-}
 {-
-Copyright (C) 2006-2010 John MacFarlane <jgm@berkeley.edu>
+Copyright (C) 2006-2014 John MacFarlane <jgm@berkeley.edu>
 
 This program is free software; you can redistribute it and/or modify
 it under the terms of the GNU General Public License as published by
@@ -18,7 +20,7 @@ Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
 
 {- |
    Module      : Text.Pandoc.Readers.RST
-   Copyright   : Copyright (C) 2006-2010 John MacFarlane
+   Copyright   : Copyright (C) 2006-2014 John MacFarlane
    License     : GNU GPL, version 2 or above
 
    Maintainer  : John MacFarlane <jgm@berkeley.edu>
@@ -28,30 +30,35 @@ Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
 Conversion from reStructuredText to 'Pandoc' document.
 -}
 module Text.Pandoc.Readers.RST (
-                                readRST
+                                readRST,
+                                readRSTWithWarnings
                                ) where
 import Text.Pandoc.Definition
+import Text.Pandoc.Builder (setMeta, fromList)
 import Text.Pandoc.Shared
 import Text.Pandoc.Parsing
 import Text.Pandoc.Options
 import Control.Monad ( when, liftM, guard, mzero )
 import Data.List ( findIndex, intersperse, intercalate,
-                   transpose, sort, deleteFirstsBy, isSuffixOf )
+                   transpose, sort, deleteFirstsBy, isSuffixOf , nub, union)
+import Data.Maybe (fromMaybe)
 import qualified Data.Map as M
 import Text.Printf ( printf )
-import Data.Maybe ( catMaybes )
-import Control.Applicative ((<$>), (<$), (<*), (*>))
+import Control.Applicative ((<$>), (<$), (<*), (*>), (<*>), pure)
 import Text.Pandoc.Builder (Inlines, Blocks, trimInlines, (<>))
 import qualified Text.Pandoc.Builder as B
 import Data.Monoid (mconcat, mempty)
 import Data.Sequence (viewr, ViewR(..))
-import Data.Char (toLower)
+import Data.Char (toLower, isHexDigit, isSpace)
 
 -- | Parse reStructuredText string and return Pandoc document.
 readRST :: ReaderOptions -- ^ Reader options
         -> String        -- ^ String to parse (assuming @'\n'@ line endings)
         -> Pandoc
 readRST opts s = (readWith parseRST) def{ stateOptions = opts } (s ++ "\n\n")
+
+readRSTWithWarnings :: ReaderOptions -> String -> (Pandoc, [String])
+readRSTWithWarnings opts s = (readWithWarnings parseRST) def{ stateOptions = opts } (s ++ "\n\n")
 
 type RSTParser = Parser [Char] ParserState
 
@@ -74,29 +81,65 @@ specialChars = "\\`|*_<>$:/[]{}()-.\"'\8216\8217\8220\8221"
 --
 
 isHeader :: Int -> Block -> Bool
-isHeader n (Header x _) = x == n
-isHeader _ _            = False
+isHeader n (Header x _ _) = x == n
+isHeader _ _              = False
 
 -- | Promote all headers in a list of blocks.  (Part of
 -- title transformation for RST.)
 promoteHeaders :: Int -> [Block] -> [Block]
-promoteHeaders num ((Header level text):rest) =
-    (Header (level - num) text):(promoteHeaders num rest)
+promoteHeaders num ((Header level attr text):rest) =
+    (Header (level - num) attr text):(promoteHeaders num rest)
 promoteHeaders num (other:rest) = other:(promoteHeaders num rest)
 promoteHeaders _   [] = []
 
 -- | If list of blocks starts with a header (or a header and subheader)
 -- of level that are not found elsewhere, return it as a title and
--- promote all the other headers.
-titleTransform :: [Block]              -- ^ list of blocks
-               -> ([Block], [Inline])  -- ^ modified list of blocks, title
-titleTransform ((Header 1 head1):(Header 2 head2):rest) |
-   not (any (isHeader 1) rest || any (isHeader 2) rest) =  -- both title & subtitle
-   (promoteHeaders 2 rest, head1 ++ [Str ":", Space] ++ head2)
-titleTransform ((Header 1 head1):rest) |
-   not (any (isHeader 1) rest) =  -- title, no subtitle
-   (promoteHeaders 1 rest, head1)
-titleTransform blocks = (blocks, [])
+-- promote all the other headers.  Also process a definition list right
+-- after the title block as metadata.
+titleTransform :: ([Block], Meta)  -- ^ list of blocks, metadata
+               -> ([Block], Meta)  -- ^ modified list of blocks, metadata
+titleTransform (bs, meta) =
+  let (bs', meta') =
+       case bs of
+          ((Header 1 _ head1):(Header 2 _ head2):rest)
+           | not (any (isHeader 1) rest || any (isHeader 2) rest) -> -- tit/sub
+            (promoteHeaders 2 rest, setMeta "title" (fromList head1) $
+              setMeta "subtitle" (fromList head2) meta)
+          ((Header 1 _ head1):rest)
+           | not (any (isHeader 1) rest) -> -- title only
+            (promoteHeaders 1 rest,
+                setMeta "title" (fromList head1) meta)
+          _ -> (bs, meta)
+  in   case bs' of
+          (DefinitionList ds : rest) ->
+            (rest, metaFromDefList ds meta')
+          _ -> (bs', meta')
+
+metaFromDefList :: [([Inline], [[Block]])] -> Meta -> Meta
+metaFromDefList ds meta = adjustAuthors $ foldr f meta ds
+ where f (k,v) = setMeta (map toLower $ stringify k) (mconcat $ map fromList v)
+       adjustAuthors (Meta metamap) = Meta $ M.adjust splitAuthors "author"
+                                           $ M.adjust toPlain "date"
+                                           $ M.adjust toPlain "title"
+                                           $ M.mapKeys (\k -> if k == "authors" then "author" else k)
+                                           $ metamap
+       toPlain (MetaBlocks [Para xs]) = MetaInlines xs
+       toPlain x                      = x
+       splitAuthors (MetaBlocks [Para xs])
+                                      = MetaList $ map MetaInlines
+                                                 $ splitAuthors' xs
+       splitAuthors x                 = x
+       splitAuthors'                  = map normalizeSpaces .
+                                         splitOnSemi . concatMap factorSemi
+       splitOnSemi                    = splitBy (==Str ";")
+       factorSemi (Str [])            = []
+       factorSemi (Str s)             = case break (==';') s of
+                                             (xs,[]) -> [Str xs]
+                                             (xs,';':ys) -> Str xs : Str ";" :
+                                                factorSemi (Str ys)
+                                             (xs,ys) -> Str xs :
+                                                factorSemi (Str ys)
+       factorSemi x                   = [x]
 
 parseRST :: RSTParser Pandoc
 parseRST = do
@@ -114,14 +157,12 @@ parseRST = do
   -- now parse it for real...
   blocks <- B.toList <$> parseBlocks
   standalone <- getOption readerStandalone
-  let (blocks', title) = if standalone
-                            then titleTransform blocks
-                            else (blocks, [])
   state <- getState
-  let authors = stateAuthors state
-  let date = stateDate state
-  let title' = if null title then stateTitle state else title
-  return $ Pandoc (Meta title' authors date) blocks'
+  let meta = stateMeta state
+  let (blocks', meta') = if standalone
+                            then titleTransform (blocks, meta)
+                            else (blocks, meta)
+  return $ Pandoc meta' blocks'
 
 --
 -- parsing blocks
@@ -143,57 +184,39 @@ block = choice [ codeBlock
                , list
                , lhsCodeBlock
                , para
+               , mempty <$ blanklines
                ] <?> "block"
 
 --
 -- field list
 --
 
-rawFieldListItem :: String -> RSTParser (String, String)
-rawFieldListItem indent = try $ do
-  string indent
+rawFieldListItem :: Int -> RSTParser (String, String)
+rawFieldListItem minIndent = try $ do
+  indent <- length <$> many (char ' ')
+  guard $ indent >= minIndent
   char ':'
   name <- many1Till (noneOf "\n") (char ':')
   (() <$ lookAhead newline) <|> skipMany1 spaceChar
-  first <- manyTill anyChar newline
-  rest <- option "" $ try $ do lookAhead (string indent >> spaceChar)
+  first <- anyLine
+  rest <- option "" $ try $ do lookAhead (count indent (char ' ') >> spaceChar)
                                indentedBlock
   let raw = (if null first then "" else (first ++ "\n")) ++ rest ++ "\n"
   return (name, raw)
 
-fieldListItem :: String
-              -> RSTParser (Maybe (Inlines, [Blocks]))
-fieldListItem indent = try $ do
-  (name, raw) <- rawFieldListItem indent
+fieldListItem :: Int -> RSTParser (Inlines, [Blocks])
+fieldListItem minIndent = try $ do
+  (name, raw) <- rawFieldListItem minIndent
   let term = B.str name
   contents <- parseFromString parseBlocks raw
   optional blanklines
-  case (name, B.toList contents) of
-       ("Author", x) -> do
-           updateState $ \st ->
-             st{ stateAuthors = stateAuthors st ++ [extractContents x] }
-           return Nothing
-       ("Authors", [BulletList auths]) -> do
-           updateState $ \st -> st{ stateAuthors = map extractContents auths }
-           return Nothing
-       ("Date", x) -> do
-           updateState $ \st -> st{ stateDate = extractContents x }
-           return Nothing
-       ("Title", x) -> do
-           updateState $ \st -> st{ stateTitle = extractContents x }
-           return Nothing
-       _            -> return $ Just (term, [contents])
-
-extractContents :: [Block] -> [Inline]
-extractContents [Plain auth] = auth
-extractContents [Para auth]  = auth
-extractContents _            = []
+  return (term, [contents])
 
 fieldList :: RSTParser Blocks
 fieldList = try $ do
-  indent <- lookAhead $ many spaceChar
+  indent <- length <$> lookAhead (many spaceChar)
   items <- many1 $ fieldListItem indent
-  case catMaybes items of
+  case items of
      []     -> return mempty
      items' -> return $ B.definitionList items'
 
@@ -201,22 +224,12 @@ fieldList = try $ do
 -- line block
 --
 
-lineBlockLine :: RSTParser Inlines
-lineBlockLine = try $ do
-  char '|'
-  char ' ' <|> lookAhead (char '\n')
-  white <- many spaceChar
-  line <- many $ (notFollowedBy newline >> inline) <|> (try $ endline >>~ char ' ')
-  optional endline
-  return $ if null white
-              then mconcat line
-              else B.str white <> mconcat line
-
 lineBlock :: RSTParser Blocks
 lineBlock = try $ do
-  lines' <- many1 lineBlockLine
-  blanklines
-  return $ B.para (mconcat $ intersperse B.linebreak lines')
+  lines' <- lineBlockLines
+  lines'' <- mapM (parseFromString
+                   (trimInlines . mconcat <$> many inline)) lines'
+  return $ B.para (mconcat $ intersperse B.linebreak lines'')
 
 --
 -- paragraph block
@@ -269,7 +282,8 @@ doubleHeader = try $ do
         Just ind -> (headerTable, ind + 1)
         Nothing -> (headerTable ++ [DoubleHeader c], (length headerTable) + 1)
   setState (state { stateHeaderTable = headerTable' })
-  return $ B.header level txt
+  attr <- registerHeader nullAttr txt
+  return $ B.headerWith attr level txt
 
 -- a header with line on the bottom only
 singleHeader :: RSTParser Blocks
@@ -289,7 +303,8 @@ singleHeader = try $ do
         Just ind -> (headerTable, ind + 1)
         Nothing -> (headerTable ++ [SingleHeader c], (length headerTable) + 1)
   setState (state { stateHeaderTable = headerTable' })
-  return $ B.header level txt
+  attr <- registerHeader nullAttr txt
+  return $ B.headerWith attr level txt
 
 --
 -- hrule block
@@ -312,7 +327,7 @@ hrule = try $ do
 indentedLine :: String -> Parser [Char] st [Char]
 indentedLine indents = try $ do
   string indents
-  manyTill anyChar newline
+  anyLine
 
 -- one or more indented lines, possibly separated by blank lines.
 -- any amount of indentation will work.
@@ -325,6 +340,13 @@ indentedBlock = try $ do
   optional blanklines
   return $ unlines lns
 
+quotedBlock :: Parser [Char] st [Char]
+quotedBlock = try $ do
+    quote <- lookAhead $ oneOf "!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~"
+    lns <- many1 $ lookAhead (char quote) >> anyLine
+    optional blanklines
+    return $ unlines lns
+
 codeBlockStart :: Parser [Char] st Char
 codeBlockStart = string "::" >> blankline >> blankline
 
@@ -332,24 +354,36 @@ codeBlock :: Parser [Char] st Blocks
 codeBlock = try $ codeBlockStart >> codeBlockBody
 
 codeBlockBody :: Parser [Char] st Blocks
-codeBlockBody = try $ B.codeBlock . stripTrailingNewlines <$> indentedBlock
+codeBlockBody = try $ B.codeBlock . stripTrailingNewlines <$>
+                (indentedBlock <|> quotedBlock)
 
 lhsCodeBlock :: RSTParser Blocks
 lhsCodeBlock = try $ do
   getPosition >>= guard . (==1) . sourceColumn
   guardEnabled Ext_literate_haskell
   optional codeBlockStart
-  lns <- many1 birdTrackLine
-  -- if (as is normal) there is always a space after >, drop it
-  let lns' = if all (\ln -> null ln || take 1 ln == " ") lns
-                then map (drop 1) lns
-                else lns
+  lns <- latexCodeBlock <|> birdCodeBlock
   blanklines
   return $ B.codeBlockWith ("", ["sourceCode", "literate", "haskell"], [])
-         $ intercalate "\n" lns'
+         $ intercalate "\n" lns
+
+latexCodeBlock :: Parser [Char] st [[Char]]
+latexCodeBlock = try $ do
+  try (latexBlockLine "\\begin{code}")
+  many1Till anyLine (try $ latexBlockLine "\\end{code}")
+ where
+  latexBlockLine s = skipMany spaceChar >> string s >> blankline
+
+birdCodeBlock :: Parser [Char] st [[Char]]
+birdCodeBlock = filterSpace <$> many1 birdTrackLine
+  where filterSpace lns =
+            -- if (as is normal) there is always a space after >, drop it
+            if all (\ln -> null ln || take 1 ln == " ") lns
+               then map (drop 1) lns
+               else lns
 
 birdTrackLine :: Parser [Char] st [Char]
-birdTrackLine = char '>' >> manyTill anyChar newline
+birdTrackLine = char '>' >> anyLine
 
 --
 -- block quotes
@@ -404,7 +438,7 @@ listLine :: Int -> RSTParser [Char]
 listLine markerLength = try $ do
   notFollowedBy blankline
   indentWith markerLength
-  line <- manyTill anyChar newline
+  line <- anyLine
   return $ line ++ "\n"
 
 -- indent by specified number of spaces (or equiv. tabs)
@@ -421,7 +455,7 @@ rawListItem :: RSTParser Int
             -> RSTParser (Int, [Char])
 rawListItem start = try $ do
   markerLength <- start
-  firstLine <- manyTill anyChar newline
+  firstLine <- anyLine
   restLines <- many (listLine markerLength)
   return (markerLength, (firstLine ++ "\n" ++ (concat restLines)))
 
@@ -439,7 +473,7 @@ listItem :: RSTParser Int
 listItem start = try $ do
   (markerLength, first) <- rawListItem start
   rest <- many (listContinuation markerLength)
-  blanks <- choice [ try (many blankline >>~ lookAhead start),
+  blanks <- choice [ try (many blankline <* lookAhead start),
                      many1 blankline ]  -- whole list must end with blank.
   -- parsing with ListItemState forces markers at beginning of lines to
   -- count as list item markers, even if not separated by blank space.
@@ -450,11 +484,16 @@ listItem start = try $ do
   -- parse the extracted block, which may itself contain block elements
   parsed <- parseFromString parseBlocks $ concat (first:rest) ++ blanks
   updateState (\st -> st {stateParserContext = oldContext})
-  return parsed
+  return $ case B.toList parsed of
+                [Para xs] -> B.singleton $ Plain xs
+                [Para xs, BulletList ys] -> B.fromList [Plain xs, BulletList ys]
+                [Para xs, OrderedList s ys] -> B.fromList [Plain xs, OrderedList s ys]
+                [Para xs, DefinitionList ys] -> B.fromList [Plain xs, DefinitionList ys]
+                _         -> parsed
 
 orderedList :: RSTParser Blocks
 orderedList = try $ do
-  (start, style, delim) <- lookAhead (anyOrderedListMarker >>~ spaceChar)
+  (start, style, delim) <- lookAhead (anyOrderedListMarker <* spaceChar)
   items <- many1 (listItem (orderedListStart style delim))
   let items' = compactify' items
   return $ B.orderedListWith (start, style, delim) items'
@@ -487,7 +526,6 @@ directive = try $ do
 -- TODO: line-block, parsed-literal, table, csv-table, list-table
 -- date
 -- include
--- class
 -- title
 directive' :: RSTParser Blocks
 directive' = do
@@ -496,17 +534,17 @@ directive' = do
   skipMany spaceChar
   top <- many $ satisfy (/='\n')
              <|> try (char '\n' <*
-                      notFollowedBy' (rawFieldListItem "   ") <*
+                      notFollowedBy' (rawFieldListItem 3) <*
                       count 3 (char ' ') <*
                       notFollowedBy blankline)
   newline
-  fields <- many $ rawFieldListItem "   "
+  fields <- many $ rawFieldListItem 3
   body <- option "" $ try $ blanklines >> indentedBlock
   optional blanklines
   let body' = body ++ "\n\n"
   case label of
         "raw" -> return $ B.rawBlock (trim top) (stripTrailingNewlines body)
-        "role" -> return mempty
+        "role" -> addNewRole top $ map (\(k,v) -> (k, trim v)) fields
         "container" -> parseFromString parseBlocks body'
         "replace" -> B.para <$>  -- consumed by substKey
                    parseFromString (trimInlines . mconcat <$> many inline)
@@ -551,12 +589,15 @@ directive' = do
                                      role -> role })
         "code" -> codeblock (lookup "number-lines" fields) (trim top) body
         "code-block" -> codeblock (lookup "number-lines" fields) (trim top) body
+        "aafig" -> do
+          let attribs = ("", ["aafig"], map (\(k,v) -> (k, trimr v)) fields)
+          return $ B.codeBlockWith attribs $ stripTrailingNewlines body
         "math" -> return $ B.para $ mconcat $ map B.displayMath
                          $ toChunks $ top ++ "\n\n" ++ body
         "figure" -> do
            (caption, legend) <- parseFromString extractCaption body'
            let src = escapeURI $ trim top
-           return $ B.para (B.image src "" caption) <> legend
+           return $ B.para (B.image src "fig:" caption) <> legend
         "image" -> do
            let src = escapeURI $ trim top
            let alt = B.str $ maybe "image" trim $ lookup "alt" fields
@@ -565,9 +606,71 @@ directive' = do
                           Just t  -> B.link (escapeURI $ trim t) ""
                                      $ B.image src "" alt
                           Nothing -> B.image src "" alt
-        _     -> return mempty
+        "class" -> do
+            let attrs = ("", (splitBy isSpace $ trim top), map (\(k,v) -> (k, trimr v)) fields)
+            --  directive content or the first immediately following element
+            children <- case body of
+                "" -> block
+                _ -> parseFromString parseBlocks  body'
+            return $ B.divWith attrs children
+        other     -> do
+            pos <- getPosition
+            addWarning (Just pos) $ "ignoring unknown directive: " ++ other
+            return mempty
 
--- Can contain haracter codes as decimal numbers or
+-- TODO:
+--  - Silently ignores illegal fields
+--  - Only supports :format: fields with a single format for :raw: roles,
+--    change Text.Pandoc.Definition.Format to fix
+addNewRole :: String -> [(String, String)] -> RSTParser Blocks
+addNewRole roleString fields = do
+    (role, parentRole) <- parseFromString inheritedRole roleString
+    customRoles <- stateRstCustomRoles <$> getState
+    let (baseRole, baseFmt, baseAttr) =
+            maybe (parentRole, Nothing, nullAttr) id $
+              M.lookup parentRole customRoles
+        fmt = if parentRole == "raw" then lookup "format" fields else baseFmt
+        annotate :: [String] -> [String]
+        annotate = maybe id (:) $
+            if parentRole == "code"
+               then lookup "language" fields
+               else Nothing
+        attr = let (ident, classes, keyValues) = baseAttr
+        -- nub in case role name & language class are the same
+               in (ident, nub . (role :) . annotate $ classes, keyValues)
+
+    -- warn about syntax we ignore
+    flip mapM_ fields $ \(key, _) -> case key of
+        "language" -> when (parentRole /= "code") $ addWarning Nothing $
+            "ignoring :language: field because the parent of role :" ++
+            role ++ ": is :" ++ parentRole ++ ": not :code:"
+        "format" -> when (parentRole /= "raw") $ addWarning Nothing $
+            "ignoring :format: field because the parent of role :" ++
+            role ++ ": is :" ++ parentRole ++ ": not :raw:"
+        _ -> addWarning Nothing $ "ignoring unknown field :" ++ key ++
+             ": in definition of role :" ++ role ++ ": in"
+    when (parentRole == "raw" && countKeys "format" > 1) $
+        addWarning Nothing $
+        "ignoring :format: fields after the first in the definition of role :"
+        ++ role ++": in"
+    when (parentRole == "code" && countKeys "language" > 1) $
+        addWarning Nothing $
+        "ignoring :language: fields after the first in the definition of role :"
+        ++ role ++": in"
+
+    updateState $ \s -> s {
+        stateRstCustomRoles =
+          M.insert role (baseRole, fmt, attr) customRoles
+    }
+
+    return $ B.singleton Null
+  where
+    countKeys k = length . filter (== k) . map fst $ fields
+    inheritedRole =
+        (,) <$> roleName <*> ((char '(' *> roleName <* char ')') <|> pure "span")
+
+
+-- Can contain character codes as decimal numbers or
 -- hexadecimal numbers, prefixed by 0x, x, \x, U+, u, or \u
 -- or as XML-style hexadecimal character entities, e.g. &#x1a2b;
 -- or text, which is used as-is.  Comments start with ..
@@ -596,9 +699,6 @@ extractUnicodeChar s = maybe Nothing (\c -> Just (c,rest)) mbc
   where (ds,rest) = span isHexDigit s
         mbc = safeRead ('\'':'\\':'x':ds ++ "'")
 
-isHexDigit :: Char -> Bool
-isHexDigit c = c `elem` "0123456789ABCDEFabcdef"
-
 extractCaption :: RSTParser (Inlines, Blocks)
 extractCaption = do
   capt <- trimInlines . mconcat <$> many inline
@@ -609,7 +709,7 @@ extractCaption = do
 toChunks :: String -> [String]
 toChunks = dropWhile null
            . map (trim . unlines)
-           . splitBy (all (`elem` " \t")) . lines
+           . splitBy (all (`elem` (" \t" :: String))) . lines
 
 codeblock :: Maybe String -> String -> String -> RSTParser Blocks
 codeblock numberLines lang body =
@@ -620,7 +720,7 @@ codeblock numberLines lang body =
           kvs     = case numberLines of
                           Just "" -> []
                           Nothing -> []
-                          Just n  -> [("startFrom",n)]
+                          Just n  -> [("startFrom",trim n)]
 
 ---
 --- note block
@@ -687,7 +787,7 @@ simpleReferenceName = do
 
 referenceName :: RSTParser Inlines
 referenceName = quotedReferenceName <|>
-                (try $ simpleReferenceName >>~ lookAhead (char ':')) <|>
+                (try $ simpleReferenceName <* lookAhead (char ':')) <|>
                 unquotedReferenceName
 
 referenceKey :: RSTParser [Char]
@@ -906,17 +1006,61 @@ strong = B.strong . trimInlines . mconcat <$>
 -- Note, this doesn't precisely implement the complex rule in
 -- http://docutils.sourceforge.net/docs/ref/rst/restructuredtext.html#inline-markup-recognition-rules
 -- but it should be good enough for most purposes
+--
+-- TODO:
+--  - Classes are silently discarded in addNewRole
+--  - Lacks sensible implementation for title-reference (which is the default)
+--  - Allows direct use of the :raw: role, rST only allows inherited use.
 interpretedRole :: RSTParser Inlines
 interpretedRole = try $ do
   (role, contents) <- roleBefore <|> roleAfter
-  case role of
-       "sup"  -> return $ B.superscript $ B.str contents
-       "sub"  -> return $ B.subscript $ B.str contents
-       "math" -> return $ B.math contents
-       _      -> return $ B.str contents  --unknown
+  renderRole contents Nothing role nullAttr
+
+renderRole :: String -> Maybe String -> String -> Attr -> RSTParser Inlines
+renderRole contents fmt role attr = case role of
+    "sup"  -> return $ B.superscript $ B.str contents
+    "superscript" -> return $ B.superscript $ B.str contents
+    "sub"  -> return $ B.subscript $ B.str contents
+    "subscript"  -> return $ B.subscript $ B.str contents
+    "emphasis" -> return $ B.emph $ B.str contents
+    "strong" -> return $ B.strong $ B.str contents
+    "rfc-reference" -> return $ rfcLink contents
+    "RFC" -> return $ rfcLink contents
+    "pep-reference" -> return $ pepLink contents
+    "PEP" -> return $ pepLink contents
+    "literal" -> return $ B.codeWith attr contents
+    "math" -> return $ B.math contents
+    "title-reference" -> titleRef contents
+    "title" -> titleRef contents
+    "t" -> titleRef contents
+    "code" -> return $ B.codeWith (addClass "sourceCode" attr) contents
+    "span" -> return $ B.spanWith attr $ B.str contents
+    "raw" -> return $ B.rawInline (fromMaybe "" fmt) contents
+    custom -> do
+        customRoles <- stateRstCustomRoles <$> getState
+        case M.lookup custom customRoles of
+            Just (newRole, newFmt, newAttr) ->
+                renderRole contents newFmt newRole newAttr
+            Nothing -> do
+                pos <- getPosition
+                addWarning (Just pos) $ "ignoring unknown role :" ++ custom ++ ": in"
+                return $ B.str contents -- Undefined role
+ where
+   titleRef ref = return $ B.str ref -- FIXME: Not a sensible behaviour
+   rfcLink rfcNo = B.link rfcUrl ("RFC " ++ rfcNo) $ B.str ("RFC " ++ rfcNo)
+     where rfcUrl = "http://www.faqs.org/rfcs/rfc" ++ rfcNo ++ ".html"
+   pepLink pepNo = B.link pepUrl ("PEP " ++ pepNo) $ B.str ("PEP " ++ pepNo)
+     where padNo = replicate (4 - length pepNo) '0' ++ pepNo
+           pepUrl = "http://www.python.org/dev/peps/pep-" ++ padNo ++ "/"
+
+addClass :: String -> Attr -> Attr
+addClass c (ident, classes, keyValues) = (ident, union classes [c], keyValues)
+
+roleName :: RSTParser String
+roleName = many1 (letter <|> char '-')
 
 roleMarker :: RSTParser String
-roleMarker = char ':' *> many1Till (letter <|> char '-') (char ':')
+roleMarker = char ':' *> roleName <* char ':'
 
 roleBefore :: RSTParser (String,String)
 roleBefore = try $ do
@@ -972,11 +1116,12 @@ explicitLink = try $ do
   src <- manyTill (noneOf ">\n") (char '>')
   skipSpaces
   string "`_"
+  optional $ char '_' -- anonymous form
   return $ B.link (escapeURI $ trim src) "" label'
 
 referenceLink :: RSTParser Inlines
 referenceLink = try $ do
-  (label',ref) <- withRaw (quotedReferenceName <|> simpleReferenceName) >>~
+  (label',ref) <- withRaw (quotedReferenceName <|> simpleReferenceName) <*
                    char '_'
   state <- getState
   let keyTable = stateKeys state
@@ -1044,7 +1189,7 @@ smart :: RSTParser Inlines
 smart = do
   getOption readerSmart >>= guard
   doubleQuoted <|> singleQuoted <|>
-    choice (map (B.singleton <$>) [apostrophe, dash, ellipses])
+    choice [apostrophe, dash, ellipses]
 
 singleQuoted :: RSTParser Inlines
 singleQuoted = try $ do

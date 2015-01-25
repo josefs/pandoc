@@ -1,6 +1,6 @@
-{-# LANGUAGE ScopedTypeVariables #-}
+{-# LANGUAGE ScopedTypeVariables, OverloadedStrings #-}
 {-
-Copyright (C) 2006-2012 John MacFarlane <jgm@berkeley.edu>
+Copyright (C) 2006-2014 John MacFarlane <jgm@berkeley.edu>
 
 This program is free software; you can redistribute it and/or modify
 it under the terms of the GNU General Public License as published by
@@ -19,7 +19,7 @@ Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
 
 {- |
    Module      : Text.Pandoc.Readers.LaTeX
-   Copyright   : Copyright (C) 2006-2012 John MacFarlane
+   Copyright   : Copyright (C) 2006-2014 John MacFarlane
    License     : GNU GPL, version 2 or above
 
    Maintainer  : John MacFarlane <jgm@berkeley.edu>
@@ -31,26 +31,32 @@ Conversion of LaTeX to 'Pandoc' document.
 module Text.Pandoc.Readers.LaTeX ( readLaTeX,
                                    rawLaTeXInline,
                                    rawLaTeXBlock,
+                                   inlineCommand,
                                    handleIncludes
                                  ) where
 
 import Text.Pandoc.Definition
+import Text.Pandoc.Walk
 import Text.Pandoc.Shared
 import Text.Pandoc.Options
-import Text.Pandoc.Biblio (processBiblio)
-import Text.Pandoc.Parsing hiding ((<|>), many, optional, space)
+import Text.Pandoc.Parsing hiding ((<|>), many, optional, space,
+                                   mathDisplay, mathInline)
 import qualified Text.Pandoc.UTF8 as UTF8
 import Data.Char ( chr, ord )
+import Control.Monad.Trans (lift)
 import Control.Monad
 import Text.Pandoc.Builder
-import Data.Char (isLetter, isPunctuation, isSpace)
+import Data.Char (isLetter, isAlphaNum)
 import Control.Applicative
 import Data.Monoid
+import Data.Maybe (fromMaybe)
 import System.Environment (getEnv)
 import System.FilePath (replaceExtension, (</>))
-import Data.List (intercalate)
+import Data.List (intercalate, intersperse)
 import qualified Data.Map as M
 import qualified Control.Exception as E
+import System.FilePath (takeExtension, addExtension)
+import Text.Pandoc.Highlighting (fromListingsLanguage)
 
 -- | Parse LaTeX from string and return 'Pandoc' document.
 readLaTeX :: ReaderOptions -- ^ Reader options
@@ -63,13 +69,9 @@ parseLaTeX = do
   bs <- blocks
   eof
   st <- getState
-  let title' = stateTitle st
-  let authors' = stateAuthors st
-  let date' = stateDate st
-  refs <- getOption readerReferences
-  mbsty <- getOption readerCitationStyle
-  return $ processBiblio mbsty refs
-         $ Pandoc (Meta title' authors' date') $ toList bs
+  let meta = stateMeta st
+  let (Pandoc _ bs') = doc bs
+  return $ Pandoc meta bs'
 
 type LP = Parser [Char] ParserState
 
@@ -101,7 +103,7 @@ dimenarg = try $ do
 
 sp :: LP ()
 sp = skipMany1 $ satisfy (\c -> c == ' ' || c == '\t')
-        <|> (try $ newline >>~ lookAhead anyChar >>~ notFollowedBy blankline)
+        <|> (try $ newline <* lookAhead anyChar <* notFollowedBy blankline)
 
 isLowerHex :: Char -> Bool
 isLowerHex x = x >= '0' && x <= '9' || x >= 'a' && x <= 'f'
@@ -123,7 +125,7 @@ comment :: LP ()
 comment = do
   char '%'
   skipMany (satisfy (/='\n'))
-  newline
+  optional newline
   return ()
 
 bgroup :: LP ()
@@ -164,28 +166,41 @@ mathChars = concat <$>
       <|> (\c -> ['\\',c]) <$> (try $ char '\\' *> anyChar)
        )
 
+quoted' :: (Inlines -> Inlines) -> LP String -> LP () -> LP Inlines
+quoted' f starter ender = do
+  startchs <- starter
+  try ((f . mconcat) <$> manyTill inline ender) <|> lit startchs
+
 double_quote :: LP Inlines
-double_quote = (doubleQuoted . mconcat) <$>
-  (try $ string "``" *> manyTill inline (try $ string "''"))
+double_quote =
+  (   quoted' doubleQuoted (try $ string "``") (void $ try $ string "''")
+  <|> quoted' doubleQuoted (string "“")        (void $ char '”')
+  -- the following is used by babel for localized quotes:
+  <|> quoted' doubleQuoted (try $ string "\"`") (void $ try $ string "\"'")
+  <|> quoted' doubleQuoted (string "\"")       (void $ char '"')
+  )
 
 single_quote :: LP Inlines
-single_quote = (singleQuoted . mconcat) <$>
-  (try $ char '`' *> manyTill inline (try $ char '\'' >> notFollowedBy letter))
+single_quote =
+  (  quoted' singleQuoted (string "`") (try $ char '\'' >> notFollowedBy letter)
+  <|> quoted' singleQuoted (string "‘") (try $ char '’' >> notFollowedBy letter)
+  )
 
 inline :: LP Inlines
 inline = (mempty <$ comment)
      <|> (space  <$ sp)
      <|> inlineText
      <|> inlineCommand
-     <|> grouped inline
+     <|> inlineEnvironment
+     <|> inlineGroup
      <|> (char '-' *> option (str "-")
            ((char '-') *> option (str "–") (str "—" <$ char '-')))
      <|> double_quote
      <|> single_quote
-     <|> (str "“" <$ try (string "``"))  -- nb. {``} won't be caught by double_quote
      <|> (str "”" <$ try (string "''"))
-     <|> (str "‘" <$ char '`')           -- nb. {`} won't be caught by single_quote
+     <|> (str "”" <$ char '”')
      <|> (str "’" <$ char '\'')
+     <|> (str "’" <$ char '’')
      <|> (str "\160" <$ char '~')
      <|> (mathDisplay $ string "$$" *> mathChars <* string "$$")
      <|> (mathInline  $ char '$' *> mathChars <* char '$')
@@ -200,11 +215,20 @@ inline = (mempty <$ comment)
 inlines :: LP Inlines
 inlines = mconcat <$> many (notFollowedBy (char '}') *> inline)
 
+inlineGroup :: LP Inlines
+inlineGroup = do
+  ils <- grouped inline
+  if isNull ils
+     then return mempty
+     else return $ spanWith nullAttr ils
+          -- we need the span so we can detitlecase bibtex entries;
+          -- we need to know when something is {C}apitalized
+
 block :: LP Blocks
 block = (mempty <$ comment)
     <|> (mempty <$ ((spaceChar <|> newline) *> spaces))
     <|> environment
-    <|> mempty <$ macro -- TODO improve macros, make them work everywhere
+    <|> macro
     <|> blockCommand
     <|> paragraph
     <|> grouped block
@@ -247,31 +271,47 @@ ignoreBlocks name = (name, doraw <|> (mempty <$ optargs))
 blockCommands :: M.Map String (LP Blocks)
 blockCommands = M.fromList $
   [ ("par", mempty <$ skipopts)
-  , ("title", mempty <$ (skipopts *> tok >>= addTitle))
-  , ("subtitle", mempty <$ (skipopts *> tok >>= addSubtitle))
+  , ("title", mempty <$ (skipopts *> tok >>= addMeta "title"))
+  , ("subtitle", mempty <$ (skipopts *> tok >>= addMeta "subtitle"))
   , ("author", mempty <$ (skipopts *> authors))
   -- -- in letter class, temp. store address & sig as title, author
-  , ("address", mempty <$ (skipopts *> tok >>= addTitle))
+  , ("address", mempty <$ (skipopts *> tok >>= addMeta "address"))
   , ("signature", mempty <$ (skipopts *> authors))
-  , ("date", mempty <$ (skipopts *> tok >>= addDate))
+  , ("date", mempty <$ (skipopts *> tok >>= addMeta "date"))
   -- sectioning
-  , ("chapter", updateState (\s -> s{ stateHasChapters = True }) *> section 0)
-  , ("section", section 1)
-  , ("subsection", section 2)
-  , ("subsubsection", section 3)
-  , ("paragraph", section 4)
-  , ("subparagraph", section 5)
+  , ("chapter", updateState (\s -> s{ stateHasChapters = True })
+                      *> section nullAttr 0)
+  , ("chapter*", updateState (\s -> s{ stateHasChapters = True })
+                      *> section ("",["unnumbered"],[]) 0)
+  , ("section", section nullAttr 1)
+  , ("section*", section ("",["unnumbered"],[]) 1)
+  , ("subsection", section nullAttr 2)
+  , ("subsection*", section ("",["unnumbered"],[]) 2)
+  , ("subsubsection", section nullAttr 3)
+  , ("subsubsection*", section ("",["unnumbered"],[]) 3)
+  , ("paragraph", section nullAttr 4)
+  , ("paragraph*", section ("",["unnumbered"],[]) 4)
+  , ("subparagraph", section nullAttr 5)
+  , ("subparagraph*", section ("",["unnumbered"],[]) 5)
   -- beamer slides
-  , ("frametitle", section 3)
-  , ("framesubtitle", section 4)
+  , ("frametitle", section nullAttr 3)
+  , ("framesubtitle", section nullAttr 4)
   -- letters
   , ("opening", (para . trimInlines) <$> (skipopts *> tok))
   , ("closing", skipopts *> closing)
   --
+  , ("hrule", pure horizontalRule)
   , ("rule", skipopts *> tok *> tok *> pure horizontalRule)
   , ("item", skipopts *> loose_item)
   , ("documentclass", skipopts *> braced *> preamble)
   , ("centerline", (para . trimInlines) <$> (skipopts *> tok))
+  , ("caption", skipopts *> setCaption)
+  , ("PandocStartInclude", startInclude)
+  , ("PandocEndInclude", endInclude)
+  , ("bibliography", mempty <$ (skipopts *> braced >>=
+                                addMeta "bibliography" . splitBibs))
+  , ("addbibresource", mempty <$ (skipopts *> braced >>=
+                                addMeta "bibliography" . splitBibs))
   ] ++ map ignoreBlocks
   -- these commands will be ignored unless --parse-raw is specified,
   -- in which case they will appear as raw latex blocks
@@ -279,7 +319,7 @@ blockCommands = M.fromList $
     -- newcommand, etc. should be parsed by macro, but we need this
     -- here so these aren't parsed as inline commands to ignore
   , "special", "pdfannot", "pdfstringdef"
-  , "bibliography", "bibliographystyle"
+  , "bibliographystyle"
   , "maketitle", "makeindex", "makeglossary"
   , "addcontentsline", "addtocontents", "addtocounter"
      -- \ignore{} is used conventionally in literate haskell for definitions
@@ -290,12 +330,27 @@ blockCommands = M.fromList $
   , "hspace", "vspace"
   ]
 
-addTitle :: Inlines -> LP ()
-addTitle tit = updateState (\s -> s{ stateTitle = toList tit })
+addMeta :: ToMetaValue a => String -> a -> LP ()
+addMeta field val = updateState $ \st ->
+  st{ stateMeta = addMetaField field val $ stateMeta st }
 
-addSubtitle :: Inlines -> LP ()
-addSubtitle tit = updateState (\s -> s{ stateTitle = stateTitle s ++
-                        toList (str ":" <> linebreak <> tit) })
+splitBibs :: String -> [Inlines]
+splitBibs = map (str . flip replaceExtension "bib" . trim) . splitBy (==',')
+
+setCaption :: LP Blocks
+setCaption = do
+  ils <- tok
+  mblabel <- option Nothing $
+               try $ spaces >> controlSeq "label" >> (Just <$> tok)
+  let ils' = case mblabel of
+                  Just lab -> ils <> spanWith
+                                ("",[],[("data-label", stringify lab)]) mempty
+                  Nothing  -> ils
+  updateState $ \st -> st{ stateCaption = Just ils' }
+  return mempty
+
+resetCaption :: LP ()
+resetCaption = updateState $ \st -> st{ stateCaption = Nothing }
 
 authors :: LP ()
 authors = try $ do
@@ -306,18 +361,17 @@ authors = try $ do
                -- skip e.g. \vspace{10pt}
   auths <- sepBy oneAuthor (controlSeq "and")
   char '}'
-  updateState (\s -> s { stateAuthors = map (normalizeSpaces . toList) auths })
+  addMeta "author" (map trimInlines auths)
 
-addDate :: Inlines -> LP ()
-addDate dat = updateState (\s -> s{ stateDate = toList dat })
-
-section :: Int -> LP Blocks
-section lvl = do
+section :: Attr -> Int -> LP Blocks
+section (ident, classes, kvs) lvl = do
   hasChapters <- stateHasChapters `fmap` getState
   let lvl' = if hasChapters then lvl + 1 else lvl
   skipopts
   contents <- grouped inline
-  return $ header lvl' contents
+  lab <- option ident $ try (spaces >> controlSeq "label" >> spaces >> braced)
+  attr' <- registerHeader (lab, classes, kvs) contents
+  return $ headerWith attr' lvl' contents
 
 inlineCommand :: LP Inlines
 inlineCommand = try $ do
@@ -327,11 +381,15 @@ inlineCommand = try $ do
   parseRaw <- getOption readerParseRaw
   star <- option "" (string "*")
   let name' = name ++ star
-  let rawargs = withRaw (skipopts *> option "" dimenarg
-                  *> many braced) >>= applyMacros' . snd
-  let raw = if parseRaw
-               then (rawInline "latex" . (('\\':name') ++)) <$> rawargs
-               else mempty <$> rawargs
+  let raw = do
+        rawargs <- withRaw (skipopts *> option "" dimenarg *> many braced)
+        let rawcommand = '\\' : name ++ star ++ snd rawargs
+        transformed <- applyMacros' rawcommand
+        if transformed /= rawcommand
+           then parseFromString inlines transformed
+           else if parseRaw
+                   then return $ rawInline "latex" rawcommand
+                   else return mempty
   case M.lookup name' inlineCommands of
        Just p      -> p <|> raw
        Nothing     -> case M.lookup name inlineCommands of
@@ -344,27 +402,52 @@ unlessParseRaw = getOption readerParseRaw >>= guard . not
 isBlockCommand :: String -> Bool
 isBlockCommand s = maybe False (const True) $ M.lookup s blockCommands
 
+
+inlineEnvironments :: M.Map String (LP Inlines)
+inlineEnvironments = M.fromList
+  [ ("displaymath", mathEnv id Nothing "displaymath")
+  , ("equation", mathEnv id Nothing "equation")
+  , ("equation*", mathEnv id Nothing "equation*")
+  , ("gather", mathEnv id (Just "gathered") "gather")
+  , ("gather*", mathEnv id (Just "gathered") "gather*")
+  , ("multline", mathEnv id (Just "gathered") "multline")
+  , ("multline*", mathEnv id (Just "gathered") "multline*")
+  , ("eqnarray", mathEnv id (Just "aligned") "eqnarray")
+  , ("eqnarray*", mathEnv id (Just "aligned") "eqnarray*")
+  , ("align", mathEnv id (Just "aligned") "align")
+  , ("align*", mathEnv id (Just "aligned") "align*")
+  , ("alignat", mathEnv id (Just "aligned") "alignat")
+  , ("alignat*", mathEnv id (Just "aligned") "alignat*")
+  ]
+
 inlineCommands :: M.Map String (LP Inlines)
 inlineCommands = M.fromList $
-  [ ("emph", emph <$> tok)
-  , ("textit", emph <$> tok)
-  , ("textsc", smallcaps <$> tok)
-  , ("sout", strikeout <$> tok)
-  , ("textsuperscript", superscript <$> tok)
-  , ("textsubscript", subscript <$> tok)
+  [ ("emph", extractSpaces emph <$> tok)
+  , ("textit", extractSpaces emph <$> tok)
+  , ("textsl", extractSpaces emph <$> tok)
+  , ("textsc", extractSpaces smallcaps <$> tok)
+  , ("sout", extractSpaces strikeout <$> tok)
+  , ("textsuperscript", extractSpaces superscript <$> tok)
+  , ("textsubscript", extractSpaces subscript <$> tok)
   , ("textbackslash", lit "\\")
   , ("backslash", lit "\\")
   , ("slash", lit "/")
-  , ("textbf", strong <$> tok)
+  , ("textbf", extractSpaces strong <$> tok)
+  , ("textnormal", extractSpaces (spanWith ("",["nodecor"],[])) <$> tok)
   , ("ldots", lit "…")
   , ("dots", lit "…")
   , ("mdots", lit "…")
   , ("sim", lit "~")
   , ("label", unlessParseRaw >> (inBrackets <$> tok))
   , ("ref", unlessParseRaw >> (inBrackets <$> tok))
+  , ("noindent", unlessParseRaw >> return mempty)
+  , ("textgreek", tok)
+  , ("sep", lit ",")
+  , ("cref", unlessParseRaw >> (inBrackets <$> tok))  -- from cleveref.sty
   , ("(", mathInline $ manyTill anyChar (try $ string "\\)"))
   , ("[", mathDisplay $ manyTill anyChar (try $ string "\\]"))
   , ("ensuremath", mathInline $ braced)
+  , ("texorpdfstring", (\_ x -> x) <$> tok <*> tok)
   , ("P", lit "¶")
   , ("S", lit "§")
   , ("$", lit "$")
@@ -375,15 +458,15 @@ inlineCommands = M.fromList $
   , ("{", lit "{")
   , ("}", lit "}")
   -- old TeX commands
-  , ("em", emph <$> inlines)
-  , ("it", emph <$> inlines)
-  , ("sl", emph <$> inlines)
-  , ("bf", strong <$> inlines)
+  , ("em", extractSpaces emph <$> inlines)
+  , ("it", extractSpaces emph <$> inlines)
+  , ("sl", extractSpaces emph <$> inlines)
+  , ("bf", extractSpaces strong <$> inlines)
   , ("rm", inlines)
-  , ("itshape", emph <$> inlines)
-  , ("slshape", emph <$> inlines)
-  , ("scshape", smallcaps <$> inlines)
-  , ("bfseries", strong <$> inlines)
+  , ("itshape", extractSpaces emph <$> inlines)
+  , ("slshape", extractSpaces emph <$> inlines)
+  , ("scshape", extractSpaces smallcaps <$> inlines)
+  , ("bfseries", extractSpaces strong <$> inlines)
   , ("/", pure mempty) -- italic correction
   , ("aa", lit "å")
   , ("AA", lit "Å")
@@ -394,9 +477,13 @@ inlineCommands = M.fromList $
   , ("l", lit "ł")
   , ("ae", lit "æ")
   , ("AE", lit "Æ")
+  , ("oe", lit "œ")
+  , ("OE", lit "Œ")
   , ("pounds", lit "£")
   , ("euro", lit "€")
   , ("copyright", lit "©")
+  , ("textasciicircum", lit "^")
+  , ("textasciitilde", lit "~")
   , ("`", option (str "`") $ try $ tok >>= accent grave)
   , ("'", option (str "'") $ try $ tok >>= accent acute)
   , ("^", option (str "^") $ try $ tok >>= accent circ)
@@ -405,6 +492,8 @@ inlineCommands = M.fromList $
   , (".", option (str ".") $ try $ tok >>= accent dot)
   , ("=", option (str "=") $ try $ tok >>= accent macron)
   , ("c", option (str "c") $ try $ tok >>= accent cedilla)
+  , ("v", option (str "v") $ try $ tok >>= accent hacek)
+  , ("u", option (str "u") $ try $ tok >>= accent breve)
   , ("i", lit "i")
   , ("\\", linebreak <$ (optional (bracketed inline) *> optional sp))
   , (",", pure mempty)
@@ -420,14 +509,14 @@ inlineCommands = M.fromList $
   , ("footnote", (note . mconcat) <$> (char '{' *> manyTill block (char '}')))
   , ("verb", doverb)
   , ("lstinline", doverb)
+  , ("Verb", doverb)
   , ("texttt", (code . stringify . toList) <$> tok)
   , ("url", (unescapeURL <$> braced) >>= \url ->
-       pure (link url "" (codeWith ("",["url"],[]) url)))
+       pure (link url "" (str url)))
   , ("href", (unescapeURL <$> braced <* optional sp) >>= \url ->
        tok >>= \lab ->
          pure (link url "" lab))
-  , ("includegraphics", skipopts *> (unescapeURL <$> braced) >>=
-       (\src -> pure (image src "" (str "image"))))
+  , ("includegraphics", skipopts *> (unescapeURL <$> braced) >>= mkImage)
   , ("enquote", enquote)
   , ("cite", citation "cite" AuthorInText False)
   , ("citep", citation "citep" NormalCitation False)
@@ -436,6 +525,7 @@ inlineCommands = M.fromList $
   , ("citealp", citation "citealp" NormalCitation False)
   , ("citealp*", citation "citealp*" NormalCitation False)
   , ("autocite", citation "autocite" NormalCitation False)
+  , ("smartcite", citation "smartcite" NormalCitation False)
   , ("footcite", inNote <$> citation "footcite" NormalCitation False)
   , ("parencite", citation "parencite" NormalCitation False)
   , ("supercite", citation "supercite" NormalCitation False)
@@ -458,6 +548,7 @@ inlineCommands = M.fromList $
   , ("supercites", citation "supercites" NormalCitation True)
   , ("footcitetexts", inNote <$> citation "footcitetexts" NormalCitation True)
   , ("Autocite", citation "Autocite" NormalCitation False)
+  , ("Smartcite", citation "Smartcite" NormalCitation False)
   , ("Footcite", citation "Footcite" NormalCitation False)
   , ("Parencite", citation "Parencite" NormalCitation False)
   , ("Supercite", citation "Supercite" NormalCitation False)
@@ -479,10 +570,21 @@ inlineCommands = M.fromList $
   , ("citeauthor", (try (tok *> optional sp *> controlSeq "citetext") *>
                         complexNatbibCitation AuthorInText)
                    <|> citation "citeauthor" AuthorInText False)
+  , ("nocite", mempty <$ (citation "nocite" NormalCitation False >>=
+                          addMeta "nocite"))
   ] ++ map ignoreInlines
   -- these commands will be ignored unless --parse-raw is specified,
   -- in which case they will appear as raw latex blocks:
-  [ "noindent", "index", "nocite" ]
+  [ "index" ]
+
+mkImage :: String -> LP Inlines
+mkImage src = do
+   let alt = str "image"
+   case takeExtension src of
+        "" -> do
+              defaultExt <- getOption readerDefaultImageExtension
+              return $ image (addExtension src defaultExt) "" alt
+        _  -> return $ image src "" alt
 
 inNote :: Inlines -> Inlines
 inNote ils =
@@ -490,9 +592,7 @@ inNote ils =
 
 unescapeURL :: String -> String
 unescapeURL ('\\':x:xs) | isEscapable x = x:unescapeURL xs
-  where isEscapable '%' = True
-        isEscapable '#' = True
-        isEscapable _   = False
+  where isEscapable c = c `elem` ("#$%&~_^\\{}" :: String)
 unescapeURL (x:xs) = x:unescapeURL xs
 unescapeURL [] = ""
 
@@ -515,137 +615,196 @@ doLHSverb = codeWith ("",["haskell"],[]) <$> manyTill (satisfy (/='\n')) (char '
 lit :: String -> LP Inlines
 lit = pure . str
 
-accent :: (Char -> Char) -> Inlines -> LP Inlines
+accent :: (Char -> String) -> Inlines -> LP Inlines
 accent f ils =
   case toList ils of
-       (Str (x:xs) : ys) -> return $ fromList $ (Str (f x : xs) : ys)
+       (Str (x:xs) : ys) -> return $ fromList $ (Str (f x ++ xs) : ys)
        []                -> mzero
        _                 -> return ils
 
-grave :: Char -> Char
-grave 'A' = 'À'
-grave 'E' = 'È'
-grave 'I' = 'Ì'
-grave 'O' = 'Ò'
-grave 'U' = 'Ù'
-grave 'a' = 'à'
-grave 'e' = 'è'
-grave 'i' = 'ì'
-grave 'o' = 'ò'
-grave 'u' = 'ù'
-grave c   = c
+grave :: Char -> String
+grave 'A' = "À"
+grave 'E' = "È"
+grave 'I' = "Ì"
+grave 'O' = "Ò"
+grave 'U' = "Ù"
+grave 'a' = "à"
+grave 'e' = "è"
+grave 'i' = "ì"
+grave 'o' = "ò"
+grave 'u' = "ù"
+grave c   = [c]
 
-acute :: Char -> Char
-acute 'A' = 'Á'
-acute 'E' = 'É'
-acute 'I' = 'Í'
-acute 'O' = 'Ó'
-acute 'U' = 'Ú'
-acute 'Y' = 'Ý'
-acute 'a' = 'á'
-acute 'e' = 'é'
-acute 'i' = 'í'
-acute 'o' = 'ó'
-acute 'u' = 'ú'
-acute 'y' = 'ý'
-acute 'C' = 'Ć'
-acute 'c' = 'ć'
-acute 'L' = 'Ĺ'
-acute 'l' = 'ĺ'
-acute 'N' = 'Ń'
-acute 'n' = 'ń'
-acute 'R' = 'Ŕ'
-acute 'r' = 'ŕ'
-acute 'S' = 'Ś'
-acute 's' = 'ś'
-acute 'Z' = 'Ź'
-acute 'z' = 'ź'
-acute c = c
+acute :: Char -> String
+acute 'A' = "Á"
+acute 'E' = "É"
+acute 'I' = "Í"
+acute 'O' = "Ó"
+acute 'U' = "Ú"
+acute 'Y' = "Ý"
+acute 'a' = "á"
+acute 'e' = "é"
+acute 'i' = "í"
+acute 'o' = "ó"
+acute 'u' = "ú"
+acute 'y' = "ý"
+acute 'C' = "Ć"
+acute 'c' = "ć"
+acute 'L' = "Ĺ"
+acute 'l' = "ĺ"
+acute 'N' = "Ń"
+acute 'n' = "ń"
+acute 'R' = "Ŕ"
+acute 'r' = "ŕ"
+acute 'S' = "Ś"
+acute 's' = "ś"
+acute 'Z' = "Ź"
+acute 'z' = "ź"
+acute c   = [c]
 
-circ :: Char -> Char
-circ 'A' = 'Â'
-circ 'E' = 'Ê'
-circ 'I' = 'Î'
-circ 'O' = 'Ô'
-circ 'U' = 'Û'
-circ 'a' = 'â'
-circ 'e' = 'ê'
-circ 'i' = 'î'
-circ 'o' = 'ô'
-circ 'u' = 'û'
-circ 'C' = 'Ĉ'
-circ 'c' = 'ĉ'
-circ 'G' = 'Ĝ'
-circ 'g' = 'ĝ'
-circ 'H' = 'Ĥ'
-circ 'h' = 'ĥ'
-circ 'J' = 'Ĵ'
-circ 'j' = 'ĵ'
-circ 'S' = 'Ŝ'
-circ 's' = 'ŝ'
-circ 'W' = 'Ŵ'
-circ 'w' = 'ŵ'
-circ 'Y' = 'Ŷ'
-circ 'y' = 'ŷ'
-circ c = c
+circ :: Char -> String
+circ 'A' = "Â"
+circ 'E' = "Ê"
+circ 'I' = "Î"
+circ 'O' = "Ô"
+circ 'U' = "Û"
+circ 'a' = "â"
+circ 'e' = "ê"
+circ 'i' = "î"
+circ 'o' = "ô"
+circ 'u' = "û"
+circ 'C' = "Ĉ"
+circ 'c' = "ĉ"
+circ 'G' = "Ĝ"
+circ 'g' = "ĝ"
+circ 'H' = "Ĥ"
+circ 'h' = "ĥ"
+circ 'J' = "Ĵ"
+circ 'j' = "ĵ"
+circ 'S' = "Ŝ"
+circ 's' = "ŝ"
+circ 'W' = "Ŵ"
+circ 'w' = "ŵ"
+circ 'Y' = "Ŷ"
+circ 'y' = "ŷ"
+circ c   = [c]
 
-tilde :: Char -> Char
-tilde 'A' = 'Ã'
-tilde 'a' = 'ã'
-tilde 'O' = 'Õ'
-tilde 'o' = 'õ'
-tilde 'I' = 'Ĩ'
-tilde 'i' = 'ĩ'
-tilde 'U' = 'Ũ'
-tilde 'u' = 'ũ'
-tilde 'N' = 'Ñ'
-tilde 'n' = 'ñ'
-tilde c   = c
+tilde :: Char -> String
+tilde 'A' = "Ã"
+tilde 'a' = "ã"
+tilde 'O' = "Õ"
+tilde 'o' = "õ"
+tilde 'I' = "Ĩ"
+tilde 'i' = "ĩ"
+tilde 'U' = "Ũ"
+tilde 'u' = "ũ"
+tilde 'N' = "Ñ"
+tilde 'n' = "ñ"
+tilde c   = [c]
 
-umlaut :: Char -> Char
-umlaut 'A' = 'Ä'
-umlaut 'E' = 'Ë'
-umlaut 'I' = 'Ï'
-umlaut 'O' = 'Ö'
-umlaut 'U' = 'Ü'
-umlaut 'a' = 'ä'
-umlaut 'e' = 'ë'
-umlaut 'i' = 'ï'
-umlaut 'o' = 'ö'
-umlaut 'u' = 'ü'
-umlaut c = c
+umlaut :: Char -> String
+umlaut 'A' = "Ä"
+umlaut 'E' = "Ë"
+umlaut 'I' = "Ï"
+umlaut 'O' = "Ö"
+umlaut 'U' = "Ü"
+umlaut 'a' = "ä"
+umlaut 'e' = "ë"
+umlaut 'i' = "ï"
+umlaut 'o' = "ö"
+umlaut 'u' = "ü"
+umlaut c   = [c]
 
-dot :: Char -> Char
-dot 'C' = 'Ċ'
-dot 'c' = 'ċ'
-dot 'E' = 'Ė'
-dot 'e' = 'ė'
-dot 'G' = 'Ġ'
-dot 'g' = 'ġ'
-dot 'I' = 'İ'
-dot 'Z' = 'Ż'
-dot 'z' = 'ż'
-dot c = c
+dot :: Char -> String
+dot 'C' = "Ċ"
+dot 'c' = "ċ"
+dot 'E' = "Ė"
+dot 'e' = "ė"
+dot 'G' = "Ġ"
+dot 'g' = "ġ"
+dot 'I' = "İ"
+dot 'Z' = "Ż"
+dot 'z' = "ż"
+dot c   = [c]
 
-macron :: Char -> Char
-macron 'A' = 'Ā'
-macron 'E' = 'Ē'
-macron 'I' = 'Ī'
-macron 'O' = 'Ō'
-macron 'U' = 'Ū'
-macron 'a' = 'ā'
-macron 'e' = 'ē'
-macron 'i' = 'ī'
-macron 'o' = 'ō'
-macron 'u' = 'ū'
-macron c = c
+macron :: Char -> String
+macron 'A' = "Ā"
+macron 'E' = "Ē"
+macron 'I' = "Ī"
+macron 'O' = "Ō"
+macron 'U' = "Ū"
+macron 'a' = "ā"
+macron 'e' = "ē"
+macron 'i' = "ī"
+macron 'o' = "ō"
+macron 'u' = "ū"
+macron c   = [c]
 
-cedilla :: Char -> Char
-cedilla 'c' = 'ç'
-cedilla 'C' = 'Ç'
-cedilla 's' = 'ş'
-cedilla 'S' = 'Ş'
-cedilla c = c
+cedilla :: Char -> String
+cedilla 'c' = "ç"
+cedilla 'C' = "Ç"
+cedilla 's' = "ş"
+cedilla 'S' = "Ş"
+cedilla 't' = "ţ"
+cedilla 'T' = "Ţ"
+cedilla 'e' = "ȩ"
+cedilla 'E' = "Ȩ"
+cedilla 'h' = "ḩ"
+cedilla 'H' = "Ḩ"
+cedilla 'o' = "o̧"
+cedilla 'O' = "O̧"
+cedilla c   = [c]
+
+hacek :: Char -> String
+hacek 'A' = "Ǎ"
+hacek 'a' = "ǎ"
+hacek 'C' = "Č"
+hacek 'c' = "č"
+hacek 'D' = "Ď"
+hacek 'd' = "ď"
+hacek 'E' = "Ě"
+hacek 'e' = "ě"
+hacek 'G' = "Ǧ"
+hacek 'g' = "ǧ"
+hacek 'H' = "Ȟ"
+hacek 'h' = "ȟ"
+hacek 'I' = "Ǐ"
+hacek 'i' = "ǐ"
+hacek 'j' = "ǰ"
+hacek 'K' = "Ǩ"
+hacek 'k' = "ǩ"
+hacek 'L' = "Ľ"
+hacek 'l' = "ľ"
+hacek 'N' = "Ň"
+hacek 'n' = "ň"
+hacek 'O' = "Ǒ"
+hacek 'o' = "ǒ"
+hacek 'R' = "Ř"
+hacek 'r' = "ř"
+hacek 'S' = "Š"
+hacek 's' = "š"
+hacek 'T' = "Ť"
+hacek 't' = "ť"
+hacek 'U' = "Ǔ"
+hacek 'u' = "ǔ"
+hacek 'Z' = "Ž"
+hacek 'z' = "ž"
+hacek c   = [c]
+
+breve :: Char -> String
+breve 'A' = "Ă"
+breve 'a' = "ă"
+breve 'E' = "Ĕ"
+breve 'e' = "ĕ"
+breve 'G' = "Ğ"
+breve 'g' = "ğ"
+breve 'I' = "Ĭ"
+breve 'i' = "ĭ"
+breve 'O' = "Ŏ"
+breve 'o' = "ŏ"
+breve 'U' = "Ŭ"
+breve 'u' = "ŭ"
+breve c   = [c]
 
 tok :: LP Inlines
 tok = try $ grouped inline <|> inlineCommand <|> str <$> (count 1 $ inlineChar)
@@ -660,7 +819,7 @@ inlineText :: LP Inlines
 inlineText = str <$> many1 inlineChar
 
 inlineChar :: LP Char
-inlineChar = noneOf "\\$%^_&~#{}^'`-[] \t\n"
+inlineChar = noneOf "\\$%^_&~#{}^'`\"‘’“”-[] \t\n"
 
 environment :: LP Blocks
 environment = do
@@ -669,6 +828,14 @@ environment = do
   case M.lookup name environments of
        Just p      -> p <|> rawEnv name
        Nothing     -> rawEnv name
+
+inlineEnvironment :: LP Inlines
+inlineEnvironment = try $ do
+  controlSeq "begin"
+  name <- braced
+  case M.lookup name inlineEnvironments of
+       Just p      -> p
+       Nothing     -> mzero
 
 rawEnv :: String -> LP Blocks
 rawEnv name = do
@@ -679,27 +846,113 @@ rawEnv name = do
             (withRaw (env name blocks) >>= applyMacros' . snd)
      else env name blocks
 
+----
+
+type IncludeParser = ParserT [Char] [String] IO String
+
 -- | Replace "include" commands with file contents.
 handleIncludes :: String -> IO String
-handleIncludes = handleIncludes' []
+handleIncludes s = do
+  res <- runParserT includeParser' [] "input" s
+  case res of
+       Right s'    -> return s'
+       Left e      -> error $ show e
 
--- parents parameter prevents infinite include loops
-handleIncludes' :: [FilePath] -> String -> IO String
-handleIncludes' _ [] = return []
-handleIncludes' parents ('\\':xs) =
-  case runParser include defaultParserState "input" ('\\':xs) of
-       Right (fs, rest) -> do yss <- mapM (\f -> if f `elem` parents
-                                                    then "" <$ warn ("Include file loop in '"
-                                                                      ++ f ++ "'.")
-                                                    else readTeXFile f >>=
-                                                           handleIncludes' (f:parents)) fs
-                              rest' <- handleIncludes' parents rest
-                              return $ intercalate "\n" yss ++ rest'
-       _  -> case runParser (verbCmd <|> verbatimEnv) defaultParserState
-                  "input" ('\\':xs) of
-                   Right (r, rest) -> (r ++) `fmap` handleIncludes' parents rest
-                   _               -> ('\\':) `fmap` handleIncludes' parents xs
-handleIncludes' parents (x:xs) = (x:) `fmap` handleIncludes' parents xs
+includeParser' :: IncludeParser
+includeParser' =
+  concat <$> many (comment' <|> escaped' <|> blob' <|> include'
+                   <|> startMarker' <|> endMarker'
+                   <|> verbCmd' <|> verbatimEnv' <|> backslash')
+
+comment' :: IncludeParser
+comment' = do
+  char '%'
+  xs <- manyTill anyChar newline
+  return ('%':xs ++ "\n")
+
+escaped' :: IncludeParser
+escaped' = try $ string "\\%" <|> string "\\\\"
+
+verbCmd' :: IncludeParser
+verbCmd' = fmap snd <$>
+  withRaw $ try $ do
+             string "\\verb"
+             c <- anyChar
+             manyTill anyChar (char c)
+
+verbatimEnv' :: IncludeParser
+verbatimEnv' = fmap snd <$>
+  withRaw $ try $ do
+             string "\\begin"
+             name <- braced'
+             guard $ name `elem` ["verbatim", "Verbatim", "lstlisting",
+                                  "minted", "alltt"]
+             manyTill anyChar (try $ string $ "\\end{" ++ name ++ "}")
+
+blob' :: IncludeParser
+blob' = try $ many1 (noneOf "\\%")
+
+backslash' :: IncludeParser
+backslash' = string "\\"
+
+braced' :: IncludeParser
+braced' = try $ char '{' *> manyTill (satisfy (/='}')) (char '}')
+
+maybeAddExtension :: String -> FilePath -> FilePath
+maybeAddExtension ext fp =
+  if null (takeExtension fp)
+     then addExtension fp ext
+     else fp
+
+include' :: IncludeParser
+include' = do
+  fs' <- try $ do
+              char '\\'
+              name <- try (string "include")
+                  <|> try (string "input")
+                  <|> string "usepackage"
+              -- skip options
+              skipMany $ try $ char '[' *> (manyTill anyChar (char ']'))
+              fs <- (map trim . splitBy (==',')) <$> braced'
+              return $ if name == "usepackage"
+                          then map (maybeAddExtension ".sty") fs
+                          else map (maybeAddExtension ".tex") fs
+  pos <- getPosition
+  containers <- getState
+  let fn = case containers of
+                (f':_) -> f'
+                []     -> "input"
+  -- now process each include file in order...
+  rest <- getInput
+  results' <- forM fs' (\f -> do
+    when (f `elem` containers) $
+      fail "Include file loop!"
+    contents <- lift $ readTeXFile f
+    return $ "\\PandocStartInclude{" ++ f ++ "}" ++
+             contents ++ "\\PandocEndInclude{" ++
+             fn ++ "}{" ++ show (sourceLine pos) ++ "}{"
+             ++ show (sourceColumn pos) ++ "}")
+  setInput $ concat results' ++ rest
+  return ""
+
+startMarker' :: IncludeParser
+startMarker' = try $ do
+  string "\\PandocStartInclude"
+  fn <- braced'
+  updateState (fn:)
+  setPosition $ newPos fn 1 1
+  return $ "\\PandocStartInclude{" ++ fn ++ "}"
+
+endMarker' :: IncludeParser
+endMarker' = try $ do
+  string "\\PandocEndInclude"
+  fn <- braced'
+  ln <- braced'
+  co <- braced'
+  updateState tail
+  setPosition $ newPos fn (fromMaybe 1 $ safeRead ln) (fromMaybe 1 $ safeRead co)
+  return $ "\\PandocEndInclude{" ++ fn ++ "}{" ++ ln ++ "}{" ++
+               co ++ "}"
 
 readTeXFile :: FilePath -> IO String
 readTeXFile f = do
@@ -714,38 +967,27 @@ readFileFromDirs (d:ds) f =
   E.catch (UTF8.readFile $ d </> f) $ \(_ :: E.SomeException) ->
     readFileFromDirs ds f
 
-include :: LP ([FilePath], String)
-include = do
-  name <- controlSeq "include"
-      <|> controlSeq "input"
-      <|> controlSeq "usepackage"
-  skipopts
-  fs <- (splitBy (==',')) <$> braced
-  rest <- getInput
-  let fs' = if name == "usepackage"
-               then map (flip replaceExtension ".sty") fs
-               else map (flip replaceExtension ".tex") fs
-  return (fs', rest)
+----
 
-verbCmd :: LP (String, String)
-verbCmd = do
-  (_,r) <- withRaw $ do
-             controlSeq "verb"
-             c <- anyChar
-             manyTill anyChar (char c)
-  rest <- getInput
-  return (r, rest)
+keyval :: LP (String, String)
+keyval = try $ do
+  key <- many1 alphaNum
+  val <- option "" $ char '=' >> many1 alphaNum
+  skipMany spaceChar
+  optional (char ',')
+  skipMany spaceChar
+  return (key, val)
 
-verbatimEnv :: LP (String, String)
-verbatimEnv = do
-  (_,r) <- withRaw $ do
-             controlSeq "begin"
-             name <- braced
-             guard $ name == "verbatim" || name == "Verbatim" ||
-                     name == "lstlisting" || name == "minted"
-             verbEnv name
-  rest <- getInput
-  return (r,rest)
+
+keyvals :: LP [(String, String)]
+keyvals = try $ char '[' *> manyTill keyval (char ']')
+
+alltt :: String -> LP Blocks
+alltt t = walk strToCode <$> parseFromString blocks
+  (substitute " " "\\ " $ substitute "%" "\\%" $
+   concat $ intersperse "\\\\\n" $ lines t)
+  where strToCode (Str s) = Code nullAttr s
+        strToCode x       = x
 
 rawLaTeXBlock :: Parser [Char] ParserState String
 rawLaTeXBlock = snd <$> try (withRaw (environment <|> blockCommand))
@@ -755,42 +997,90 @@ rawLaTeXInline = do
   raw <- (snd <$> withRaw inlineCommand) <|> (snd <$> withRaw blockCommand)
   RawInline "latex" <$> applyMacros' raw
 
+addImageCaption :: Blocks -> LP Blocks
+addImageCaption = walkM go
+  where go (Image alt (src,tit)) = do
+          mbcapt <- stateCaption <$> getState
+          case mbcapt of
+               Just ils -> return (Image (toList ils) (src, "fig:"))
+               Nothing  -> return (Image alt (src,tit))
+        go x = return x
+
+addTableCaption :: Blocks -> LP Blocks
+addTableCaption = walkM go
+  where go (Table c als ws hs rs) = do
+          mbcapt <- stateCaption <$> getState
+          case mbcapt of
+               Just ils -> return (Table (toList ils) als ws hs rs)
+               Nothing  -> return (Table c als ws hs rs)
+        go x = return x
+
 environments :: M.Map String (LP Blocks)
 environments = M.fromList
   [ ("document", env "document" blocks <* skipMany anyChar)
   , ("letter", env "letter" letter_contents)
+  , ("figure", env "figure" $
+         resetCaption *> skipopts *> blocks >>= addImageCaption)
   , ("center", env "center" blocks)
-  , ("tabular", env "tabular" simpTable)
+  , ("table",  env "table" $
+         resetCaption *> skipopts *> blocks >>= addTableCaption)
+  , ("tabular*", env "tabular" $ simpTable True)
+  , ("tabular", env "tabular"  $ simpTable False)
   , ("quote", blockQuote <$> env "quote" blocks)
   , ("quotation", blockQuote <$> env "quotation" blocks)
   , ("verse", blockQuote <$> env "verse" blocks)
   , ("itemize", bulletList <$> listenv "itemize" (many item))
   , ("description", definitionList <$> listenv "description" (many descItem))
   , ("enumerate", ordered_list)
+  , ("alltt", alltt =<< verbEnv "alltt")
   , ("code", guardEnabled Ext_literate_haskell *>
       (codeBlockWith ("",["sourceCode","literate","haskell"],[]) <$>
         verbEnv "code"))
   , ("verbatim", codeBlock <$> (verbEnv "verbatim"))
-  , ("Verbatim", codeBlock <$> (verbEnv "Verbatim"))
-  , ("lstlisting", codeBlock <$> (verbEnv "lstlisting"))
-  , ("minted", liftA2 (\l c -> codeBlockWith ("",[l],[]) c)
-            (grouped (many1 $ satisfy (/= '}'))) (verbEnv "minted"))
+  , ("Verbatim",   do options <- option [] keyvals
+                      let kvs = [ (if k == "firstnumber"
+                                      then "startFrom"
+                                      else k, v) | (k,v) <- options ]
+                      let classes = [ "numberLines" |
+                                      lookup "numbers" options == Just "left" ]
+                      let attr = ("",classes,kvs)
+                      codeBlockWith attr <$> (verbEnv "Verbatim"))
+  , ("lstlisting", do options <- option [] keyvals
+                      let kvs = [ (if k == "firstnumber"
+                                      then "startFrom"
+                                      else k, v) | (k,v) <- options ]
+                      let classes = [ "numberLines" |
+                                      lookup "numbers" options == Just "left" ]
+                                 ++ maybe [] (:[]) (lookup "language" options
+                                         >>= fromListingsLanguage)
+                      let attr = (fromMaybe "" (lookup "label" options),classes,kvs)
+                      codeBlockWith attr <$> (verbEnv "lstlisting"))
+  , ("minted",     do options <- option [] keyvals
+                      lang <- grouped (many1 $ satisfy (/='}'))
+                      let kvs = [ (if k == "firstnumber"
+                                      then "startFrom"
+                                      else k, v) | (k,v) <- options ]
+                      let classes = [ lang | not (null lang) ] ++
+                                    [ "numberLines" |
+                                      lookup "linenos" options == Just "true" ]
+                      let attr = ("",classes,kvs)
+                      codeBlockWith attr <$> (verbEnv "minted"))
   , ("obeylines", parseFromString
                   (para . trimInlines . mconcat <$> many inline) =<<
                   intercalate "\\\\\n" . lines <$> verbEnv "obeylines")
-  , ("displaymath", mathEnv Nothing "displaymath")
-  , ("equation", mathEnv Nothing "equation")
-  , ("equation*", mathEnv Nothing "equation*")
-  , ("gather", mathEnv (Just "gathered") "gather")
-  , ("gather*", mathEnv (Just "gathered") "gather*")
-  , ("multline", mathEnv (Just "gathered") "multline")
-  , ("multline*", mathEnv (Just "gathered") "multline*")
-  , ("eqnarray", mathEnv (Just "aligned") "eqnarray")
-  , ("eqnarray*", mathEnv (Just "aligned") "eqnarray*")
-  , ("align", mathEnv (Just "aligned") "align")
-  , ("align*", mathEnv (Just "aligned") "align*")
-  , ("alignat", mathEnv (Just "aligned") "alignat")
-  , ("alignat*", mathEnv (Just "aligned") "alignat*")
+  , ("displaymath", mathEnv para Nothing "displaymath")
+  , ("equation", mathEnv para Nothing "equation")
+  , ("equation*", mathEnv para Nothing "equation*")
+  , ("gather", mathEnv para (Just "gathered") "gather")
+  , ("gather*", mathEnv para (Just "gathered") "gather*")
+  , ("multline", mathEnv para (Just "gathered") "multline")
+  , ("multline*", mathEnv para (Just "gathered") "multline*")
+  , ("eqnarray", mathEnv para (Just "aligned") "eqnarray")
+  , ("eqnarray*", mathEnv para (Just "aligned") "eqnarray*")
+  , ("align", mathEnv para (Just "aligned") "align")
+  , ("align*", mathEnv para (Just "aligned") "align*")
+  , ("alignat", mathEnv para (Just "aligned") "alignat")
+  , ("alignat*", mathEnv para (Just "aligned") "alignat*")
   ]
 
 letter_contents :: LP Blocks
@@ -798,20 +1088,24 @@ letter_contents = do
   bs <- blocks
   st <- getState
   -- add signature (author) and address (title)
-  let addr = case stateTitle st of
-                  []   -> mempty
-                  x    -> para $ trimInlines $ fromList x
-  updateState $ \s -> s{ stateAuthors = [], stateTitle = [] }
+  let addr = case lookupMeta "address" (stateMeta st) of
+                  Just (MetaBlocks [Plain xs]) ->
+                     para $ trimInlines $ fromList xs
+                  _ -> mempty
   return $ addr <> bs -- sig added by \closing
 
 closing :: LP Blocks
 closing = do
   contents <- tok
   st <- getState
-  let sigs = case stateAuthors st of
-                  []   -> mempty
-                  xs   -> para $ trimInlines $ fromList
-                               $ intercalate [LineBreak] xs
+  let extractInlines (MetaBlocks [Plain ys]) = ys
+      extractInlines (MetaBlocks [Para ys ]) = ys
+      extractInlines _          = []
+  let sigs = case lookupMeta "author" (stateMeta st) of
+                  Just (MetaList xs) ->
+                    para $ trimInlines $ fromList $
+                      intercalate [LineBreak] $ map extractInlines xs
+                  _ -> mempty
   return $ para (trimInlines contents) <> sigs
 
 item :: LP Blocks
@@ -846,8 +1140,8 @@ listenv name p = try $ do
   updateState $ \st -> st{ stateParserContext = oldCtx }
   return res
 
-mathEnv :: Maybe String -> String -> LP Blocks
-mathEnv innerEnv name = para <$> mathDisplay (inner <$> verbEnv name)
+mathEnv :: (Inlines -> a) -> Maybe String -> String -> LP a
+mathEnv f innerEnv name = f <$> mathDisplay (inner <$> verbEnv name)
    where inner x = case innerEnv of
                       Nothing -> x
                       Just y  -> "\\begin{" ++ y ++ "}\n" ++ x ++
@@ -880,22 +1174,22 @@ ordered_list = do
 
 paragraph :: LP Blocks
 paragraph = do
-  x <- mconcat <$> many1 inline
+  x <- trimInlines . mconcat <$> many1 inline
   if x == mempty
      then return mempty
-     else return $ para $ trimInlines x
+     else return $ para x
 
 preamble :: LP Blocks
 preamble = mempty <$> manyTill preambleBlock beginDoc
-  where beginDoc = lookAhead $ controlSeq "begin" *> string "{document}"
-        preambleBlock =  (mempty <$ comment)
-                     <|> (mempty <$ sp)
-                     <|> (mempty <$ blanklines)
-                     <|> (mempty <$ macro)
-                     <|> blockCommand
-                     <|> (mempty <$ anyControlSeq)
-                     <|> (mempty <$ braced)
-                     <|> (mempty <$ anyChar)
+  where beginDoc = lookAhead $ try $ controlSeq "begin" *> string "{document}"
+        preambleBlock =  (void comment)
+                     <|> (void sp)
+                     <|> (void blanklines)
+                     <|> (void macro)
+                     <|> (void blockCommand)
+                     <|> (void anyControlSeq)
+                     <|> (void braced)
+                     <|> (void anyChar)
 
 -------
 
@@ -907,12 +1201,8 @@ addPrefix _ _ = []
 
 addSuffix :: [Inline] -> [Citation] -> [Citation]
 addSuffix s ks@(_:_) =
-  let k  = last ks
-      s' = case s of
-                (Str (c:_):_)
-                  | not (isPunctuation c || isSpace c) -> Str "," : Space : s
-                _                                      -> s
-  in  init ks ++ [k {citationSuffix = citationSuffix k ++ s'}]
+  let k = last ks
+  in  init ks ++ [k {citationSuffix = citationSuffix k ++ s}]
 addSuffix _ _ = []
 
 simpleCiteArgs :: LP [Citation]
@@ -920,6 +1210,7 @@ simpleCiteArgs = try $ do
   first  <- optionMaybe $ toList <$> opt
   second <- optionMaybe $ toList <$> opt
   char '{'
+  optional sp
   keys <- manyTill citationLabel (char '}')
   let (pre, suf) = case (first  , second ) of
         (Just s , Nothing) -> (mempty, s )
@@ -935,18 +1226,24 @@ simpleCiteArgs = try $ do
   return $ addPrefix pre $ addSuffix suf $ map conv keys
 
 citationLabel :: LP String
-citationLabel  = trim <$>
-  (many1 (satisfy $ \c -> c /=',' && c /='}') <* optional (char ',') <* optional sp)
+citationLabel  = optional sp *>
+  (many1 (satisfy isBibtexKeyChar)
+          <* optional sp
+          <* optional (char ',')
+          <* optional sp)
+  where isBibtexKeyChar c = isAlphaNum c || c `elem` (".:;?!`'()/*@_+=-[]*" :: String)
 
 cites :: CitationMode -> Bool -> LP [Citation]
 cites mode multi = try $ do
   cits <- if multi
              then many1 simpleCiteArgs
              else count 1 simpleCiteArgs
-  let (c:cs) = concat cits
+  let cs = concat cits
   return $ case mode of
-        AuthorInText   -> c {citationMode = mode} : cs
-        _              -> map (\a -> a {citationMode = mode}) (c:cs)
+        AuthorInText -> case cs of
+                             (c:rest) -> c {citationMode = mode} : rest
+                             []       -> []
+        _            -> map (\a -> a {citationMode = mode}) cs
 
 citation :: String -> CitationMode -> Bool -> LP Inlines
 citation name mode multi = do
@@ -978,12 +1275,14 @@ complexNatbibCitation mode = try $ do
 parseAligns :: LP [Alignment]
 parseAligns = try $ do
   char '{'
-  optional $ char '|'
+  let maybeBar = skipMany $ sp <|> () <$ char '|' <|> () <$ try (string "@{}")
+  maybeBar
   let cAlign = AlignCenter <$ char 'c'
   let lAlign = AlignLeft <$ char 'l'
   let rAlign = AlignRight <$ char 'r'
-  let alignChar = optional sp *> (cAlign <|> lAlign <|> rAlign)
-  aligns' <- sepEndBy alignChar (optional $ char '|')
+  let parAlign = AlignLeft <$ (char 'p' >> braced)
+  let alignChar = cAlign <|> lAlign <|> rAlign <|> parAlign
+  aligns' <- sepEndBy alignChar maybeBar
   spaces
   char '}'
   spaces
@@ -1003,13 +1302,18 @@ parseTableRow :: Int  -- ^ number of columns
 parseTableRow cols = try $ do
   let tableCellInline = notFollowedBy (amp <|> lbreak) >> inline
   let tableCell = (plain . trimInlines . mconcat) <$> many tableCellInline
-  cells' <- sepBy tableCell amp
-  guard $ length cells' == cols
+  cells' <- sepBy1 tableCell amp
+  let numcells = length cells'
+  guard $ numcells <= cols && numcells >= 1
+  guard $ cells' /= [mempty]
+  -- note:  a & b in a three-column table leaves an empty 3rd cell:
+  let cells'' = cells' ++ replicate (cols - numcells) mempty
   spaces
-  return cells'
+  return cells''
 
-simpTable :: LP Blocks
-simpTable = try $ do
+simpTable :: Bool -> LP Blocks
+simpTable hasWidthParameter = try $ do
+  when hasWidthParameter $ () <$ (spaces >> tok)
   spaces
   aligns <- parseAligns
   let cols = length aligns
@@ -1017,9 +1321,23 @@ simpTable = try $ do
   header' <- option [] $ try (parseTableRow cols <* lbreak <* hline)
   rows <- sepEndBy (parseTableRow cols) (lbreak <* optional hline)
   spaces
+  skipMany (comment *> spaces)
   let header'' = if null header'
                     then replicate cols mempty
                     else header'
   lookAhead $ controlSeq "end" -- make sure we're at end
   return $ table mempty (zip aligns (repeat 0)) header'' rows
 
+startInclude :: LP Blocks
+startInclude = do
+  fn <- braced
+  setPosition $ newPos fn 1 1
+  return mempty
+
+endInclude :: LP Blocks
+endInclude = do
+  fn <- braced
+  ln <- braced
+  co <- braced
+  setPosition $ newPos fn (fromMaybe 1 $ safeRead ln) (fromMaybe 1 $ safeRead co)
+  return mempty

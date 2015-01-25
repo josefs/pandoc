@@ -1,16 +1,20 @@
 module Text.Pandoc.Readers.DocBook ( readDocBook ) where
-import Data.Char (toUpper, isDigit)
+import Data.Char (toUpper)
+import Text.Pandoc.Shared (safeRead)
 import Text.Pandoc.Options
 import Text.Pandoc.Definition
 import Text.Pandoc.Builder
 import Text.XML.Light
-import Text.HTML.TagSoup.Entity (lookupEntity)
+import Text.Pandoc.Compat.TagSoupEntity (lookupEntity)
+import Data.Either (rights)
 import Data.Generics
 import Data.Monoid
 import Data.Char (isSpace)
 import Control.Monad.State
 import Control.Applicative ((<$>))
 import Data.List (intersperse)
+import Data.Maybe (fromMaybe)
+import Text.TeXMath (readMathML, writeTeX)
 
 {-
 
@@ -43,7 +47,7 @@ List of all DocBook tags, with [x] indicating implemented,
 [ ] audioobject - A wrapper for audio data and its associated meta-information
 [x] author - The name of an individual author
 [ ] authorblurb - A short description or note about an author
-[ ] authorgroup - Wrapper for author information when a document has
+[x] authorgroup - Wrapper for author information when a document has
     multiple authors or collabarators
 [x] authorinitials - The initials or other short identifier for an author
 [o] beginpage - The location of a page break in a print version of the document
@@ -66,8 +70,8 @@ List of all DocBook tags, with [x] indicating implemented,
 [x] book - A book
 [x] bookinfo - Meta-information for a Book
 [x] bridgehead - A free-floating heading
-[ ] callout - A “called out” description of a marked Area
-[ ] calloutlist - A list of Callouts
+[x] callout - A “called out” description of a marked Area
+[x] calloutlist - A list of Callouts
 [x] caption - A caption
 [x] caution - A note of caution
 [x] chapter - A chapter, as of a book
@@ -77,7 +81,7 @@ List of all DocBook tags, with [x] indicating implemented,
 [ ] citerefentry - A citation to a reference page
 [ ] citetitle - The title of a cited work
 [ ] city - The name of a city in an address
-[ ] classname - The name of a class, in the object-oriented programming sense
+[x] classname - The name of a class, in the object-oriented programming sense
 [ ] classsynopsis - The syntax summary for a class definition
 [ ] classsynopsisinfo - Information supplementing the contents of
     a ClassSynopsis
@@ -124,7 +128,7 @@ List of all DocBook tags, with [x] indicating implemented,
 [ ] envar - A software environment variable
 [x] epigraph - A short inscription at the beginning of a document or component
     note:  also handle embedded attribution tag
-[ ] equation - A displayed mathematical equation
+[x] equation - A displayed mathematical equation
 [ ] errorcode - An error code
 [ ] errorname - An error name
 [ ] errortext - An error message.
@@ -165,9 +169,9 @@ List of all DocBook tags, with [x] indicating implemented,
 [ ] guibutton - The text on a button in a GUI
 [ ] guiicon - Graphic and/or text appearing as a icon in a GUI
 [ ] guilabel - The text of a label in a GUI
-[ ] guimenu - The name of a menu in a GUI
-[ ] guimenuitem - The name of a terminal menu item in a GUI
-[ ] guisubmenu - The name of a submenu in a GUI
+[x] guimenu - The name of a menu in a GUI
+[x] guimenuitem - The name of a terminal menu item in a GUI
+[x] guisubmenu - The name of a submenu in a GUI
 [ ] hardware - A physical part of a computer system
 [ ] highlights - A summary of the main points of the discussed component
 [ ] holder - The name of the individual or organization that holds a copyright
@@ -183,12 +187,12 @@ List of all DocBook tags, with [x] indicating implemented,
 [x] indexinfo - Meta-information for an Index
 [x] indexterm - A wrapper for terms to be indexed
 [x] info - A wrapper for information about a component or other block. (DocBook v5)
-[ ] informalequation - A displayed mathematical equation without a title
+[x] informalequation - A displayed mathematical equation without a title
 [ ] informalexample - A displayed example without a title
 [ ] informalfigure - A untitled figure
 [ ] informaltable - A table without a title
 [ ] initializer - The initializer for a FieldSynopsis
-[ ] inlineequation - A mathematical equation or expression occurring inline
+[x] inlineequation - A mathematical equation or expression occurring inline
 [ ] inlinegraphic - An object containing or pointing to graphical data
     that will be rendered inline
 [x] inlinemediaobject - An inline media object (video, audio, image, and so on)
@@ -202,10 +206,10 @@ List of all DocBook tags, with [x] indicating implemented,
     other dingbat
 [ ] itermset - A set of index terms in the meta-information of a document
 [ ] jobtitle - The title of an individual in an organization
-[ ] keycap - The text printed on a key on a keyboard
+[x] keycap - The text printed on a key on a keyboard
 [ ] keycode - The internal, frequently numeric, identifier for a key
     on a keyboard
-[ ] keycombo - A combination of input actions
+[x] keycombo - A combination of input actions
 [ ] keysym - The symbolic name of a key on a keyboard
 [ ] keyword - One of a set of keywords describing the content of a document
 [ ] keywordset - A set of keywords describing the content of a document
@@ -233,11 +237,11 @@ List of all DocBook tags, with [x] indicating implemented,
 [x] mediaobject - A displayed media object (video, audio, image, etc.)
 [ ] mediaobjectco - A media object that contains callouts
 [x] member - An element of a simple list
-[ ] menuchoice - A selection or series of selections from a menu
+[x] menuchoice - A selection or series of selections from a menu
 [ ] methodname - The name of a method
 [ ] methodparam - Parameters to a method
 [ ] methodsynopsis - A syntax summary for a method
-[ ] mml:math - A MathML equation
+[x] mml:math - A MathML equation
 [ ] modespec - Application-specific information necessary for the
     completion of an OLink
 [ ] modifier - Modifiers in a synopsis
@@ -339,7 +343,7 @@ List of all DocBook tags, with [x] indicating implemented,
 [x] refsectioninfo - Meta-information for a refsection
 [ ] refsynopsisdiv - A syntactic synopsis of the subject of the reference page
 [ ] refsynopsisdivinfo - Meta-information for a RefSynopsisDiv
-[ ] releaseinfo - Information about a particular release of a document
+[x] releaseinfo - Information about a particular release of a document
 [ ] remark - A remark (or comment) intended for presentation in a draft
     manuscript
 [ ] replaceable - Content that may or must be replaced by the user
@@ -467,7 +471,7 @@ List of all DocBook tags, with [x] indicating implemented,
 [ ] token - A unit of information
 [x] tr - A row in an HTML table
 [ ] trademark - A trademark
-[ ] type - The classification of a value
+[x] type - The classification of a value
 [x] ulink - A link that addresses its target by means of a URL
     (Uniform Resource Locator)
 [x] uri - A Uniform Resource Identifier
@@ -490,34 +494,40 @@ List of all DocBook tags, with [x] indicating implemented,
     anything else
 [ ] xref - A cross reference to another part of the document
 [ ] year - The year of publication of a document
-
+[x] ?asciidoc-br? - line break from asciidoc docbook output
 -}
 
 type DB = State DBState
 
 data DBState = DBState{ dbSectionLevel :: Int
                       , dbQuoteType    :: QuoteType
-                      , dbDocTitle     :: Inlines
-                      , dbDocAuthors   :: [Inlines]
-                      , dbDocDate      :: Inlines
+                      , dbMeta         :: Meta
+                      , dbAcceptsMeta  :: Bool
                       , dbBook         :: Bool
                       , dbFigureTitle  :: Inlines
                       } deriving Show
 
 readDocBook :: ReaderOptions -> String -> Pandoc
-readDocBook _ inp  = setTitle (dbDocTitle st')
-                   $ setAuthors (dbDocAuthors st')
-                   $ setDate (dbDocDate st')
-                   $ doc $ mconcat bs
-  where (bs, st') = runState (mapM parseBlock $ normalizeTree $ parseXML inp)
+readDocBook _ inp  = Pandoc (dbMeta st') (toList $ mconcat bs)
+  where (bs, st') = runState (mapM parseBlock $ normalizeTree $ parseXML inp')
                              DBState{ dbSectionLevel = 0
                                     , dbQuoteType = DoubleQuote
-                                    , dbDocTitle = mempty
-                                    , dbDocAuthors = []
-                                    , dbDocDate = mempty
+                                    , dbMeta = mempty
+                                    , dbAcceptsMeta = False
                                     , dbBook = False
                                     , dbFigureTitle = mempty
                                     }
+        inp' = handleInstructions inp
+
+-- We treat <?asciidoc-br?> specially (issue #1236), converting it
+-- to <br/>, since xml-light doesn't parse the instruction correctly.
+-- Other xml instructions are simply removed from the input stream.
+handleInstructions :: String -> String
+handleInstructions ('<':'?':'a':'s':'c':'i':'i':'d':'o':'c':'-':'b':'r':'?':'>':xs) = '<':'b':'r':'/':'>': handleInstructions xs
+handleInstructions xs = case break (=='<') xs of
+                             (ys, [])     -> ys
+                             ([], '<':zs) -> '<' : handleInstructions zs
+                             (ys, zs) -> ys ++ handleInstructions zs
 
 getFigure :: Element -> DB Blocks
 getFigure e = do
@@ -558,6 +568,30 @@ attrValue attr elt =
 named :: String -> Element -> Bool
 named s e = qName (elName e) == s
 
+--
+
+acceptingMetadata :: DB a -> DB a
+acceptingMetadata p = do
+  modify (\s -> s { dbAcceptsMeta = True } )
+  res <- p
+  modify (\s -> s { dbAcceptsMeta = False })
+  return res
+
+checkInMeta :: Monoid a => DB () -> DB a
+checkInMeta p = do
+  accepts <- dbAcceptsMeta <$> get
+  when accepts p
+  return mempty
+
+
+
+addMeta :: ToMetaValue a => String -> a -> DB ()
+addMeta field val = modify (setMeta field val)
+
+instance HasMeta DBState where
+  setMeta field v s =  s {dbMeta = setMeta field v (dbMeta s)}
+  deleteMeta field s = s {dbMeta = deleteMeta field (dbMeta s)}
+
 isBlockElement :: Content -> Bool
 isBlockElement (Elem e) = qName (elName e) `elem` blocktags
   where blocktags = ["toc","index","para","formalpara","simpara",
@@ -569,7 +603,7 @@ isBlockElement (Elem e) = qName (elName e) `elem` blocktags
            "important","caution","note","tip","warning","qandadiv",
            "question","answer","abstract","itemizedlist","orderedlist",
            "variablelist","article","book","table","informaltable",
-           "screen","programlisting","example"]
+           "screen","programlisting","example","calloutlist"]
 isBlockElement _ = False
 
 -- Trim leading and trailing newline characters
@@ -604,6 +638,7 @@ getImage e = do
 getBlocks :: Element -> DB Blocks
 getBlocks e =  mconcat <$> (mapM parseBlock $ elContent e)
 
+
 parseBlock :: Content -> DB Blocks
 parseBlock (Text (CData CDataRaw _ _)) = return mempty -- DOCTYPE
 parseBlock (Text (CData _ s _)) = if all isSpace s
@@ -617,10 +652,10 @@ parseBlock (Elem e) =
         "para"  -> parseMixed para (elContent e)
         "formalpara" -> do
            tit <- case filterChild (named "title") e of
-                        Just t  -> (<> str "." <> linebreak) <$> emph
-                                      <$> getInlines t
+                        Just t  -> (para . strong . (<> str ".")) <$>
+                                     getInlines t
                         Nothing -> return mempty
-           addToStart tit <$> parseMixed para (elContent e)
+           (tit <>) <$> parseMixed para (elContent e)
         "simpara"  -> parseMixed para (elContent e)
         "ackno"  -> parseMixed para (elContent e)
         "epigraph" -> parseBlockquote
@@ -628,7 +663,11 @@ parseBlock (Elem e) =
         "attribution" -> return mempty
         "titleabbrev" -> return mempty
         "authorinitials" -> return mempty
-        "title" -> return mempty -- handled by getTitle or sect or figure
+        "title" ->  checkInMeta getTitle
+        "author" -> checkInMeta getAuthor
+        "authorgroup" -> checkInMeta getAuthorGroup
+        "releaseinfo" -> checkInMeta (getInlines e >>= addMeta "release")
+        "date" -> checkInMeta getDate
         "bibliography" -> sect 0
         "bibliodiv" -> sect 1
         "biblioentry" -> parseMixed para (elContent e)
@@ -673,6 +712,7 @@ parseBlock (Elem e) =
         "question" -> addToStart (strong (str "Q:") <> str " ") <$> getBlocks e
         "answer" -> addToStart (strong (str "A:") <> str " ") <$> getBlocks e
         "abstract" -> blockQuote <$> getBlocks e
+        "calloutlist" -> bulletList <$> callouts
         "itemizedlist" -> bulletList <$> listitems
         "orderedlist" -> do
           let listStyle = case attrValue "numeration" e of
@@ -682,18 +722,17 @@ parseBlock (Elem e) =
                                "lowerroman" -> LowerRoman
                                "upperroman" -> UpperRoman
                                _            -> Decimal
-          let start = case attrValue "override" <$>
-                            filterElement (named "listitem") e of
-                              Just x@(_:_) | all isDigit x -> read x
-                              _                            -> 1
+          let start = fromMaybe 1 $
+                      (attrValue "override" <$> filterElement (named "listitem") e)
+                       >>= safeRead
           orderedListWith (start,listStyle,DefaultDelim)
             <$> listitems
         "variablelist" -> definitionList <$> deflistitems
         "figure" -> getFigure e
         "mediaobject" -> para <$> getImage e
         "caption" -> return mempty
-        "info" -> getTitle >> getAuthors >> getDate >> return mempty
-        "articleinfo" -> getTitle >> getAuthors >> getDate >> return mempty
+        "info" -> metaBlock
+        "articleinfo" -> metaBlock
         "sectioninfo" -> return mempty  -- keywords & other metadata
         "refsectioninfo" -> return mempty  -- keywords & other metadata
         "refsect1info" -> return mempty  -- keywords & other metadata
@@ -707,10 +746,10 @@ parseBlock (Elem e) =
         "chapterinfo" -> return mempty  -- keywords & other metadata
         "glossaryinfo" -> return mempty  -- keywords & other metadata
         "appendixinfo" -> return mempty  -- keywords & other metadata
-        "bookinfo" -> getTitle >> getAuthors >> getDate >> return mempty
+        "bookinfo" -> metaBlock
         "article" -> modify (\st -> st{ dbBook = False }) >>
-                          getTitle >> getBlocks e
-        "book" -> modify (\st -> st{ dbBook = True }) >> getTitle >> getBlocks e
+                           getBlocks e
+        "book" -> modify (\st -> st{ dbBook = True }) >>  getBlocks e
         "table" -> parseTable
         "informaltable" -> parseTable
         "literallayout" -> codeBlockWithLang
@@ -733,7 +772,7 @@ parseBlock (Elem e) =
                                 ""   -> []
                                 x    -> [x]
            return $ codeBlockWith (attrValue "id" e, classes', [])
-                  $ trimNl $ strContent e
+                  $ trimNl $ strContentRecursive e
          parseBlockquote = do
             attrib <- case filterChild (named "attribution") e of
                              Nothing  -> return mempty
@@ -742,6 +781,7 @@ parseBlock (Elem e) =
             contents <- getBlocks e
             return $ blockQuote (contents <> attrib)
          listitems = mapM getBlocks $ filterChildren (named "listitem") e
+         callouts = mapM getBlocks $ filterChildren (named "callout") e
          deflistitems = mapM parseVarListEntry $ filterChildren
                      (named "varlistentry") e
          parseVarListEntry e' = do
@@ -756,30 +796,25 @@ parseBlock (Elem e) =
                      terms' <- mapM getInlines terms
                      items' <- mapM getBlocks items
                      return (mconcat $ intersperse (str "; ") terms', items')
-         getTitle = case filterChild (named "title") e of
-                         Just t  -> do
-                            tit <- getInlines t
-                            subtit <-  case filterChild (named "subtitle") e of
-                                            Just s  -> (text ": " <>) <$>
-                                                         getInlines s
-                                            Nothing -> return mempty
-                            modify $ \st -> st{dbDocTitle = tit <> subtit}
-                         Nothing -> return ()
-         getAuthors = do
-                      auths <- mapM getInlines
-                               $ filterChildren (named "author") e
-                      modify $ \st -> st{dbDocAuthors = auths}
-         getDate = case filterChild (named "date") e of
-                         Just t  -> do
-                            dat <- getInlines t
-                            modify $ \st -> st{dbDocDate = dat}
-                         Nothing -> return ()
+         getTitle =  do
+                     tit <- getInlines e
+                     subtit <-  case filterChild (named "subtitle") e of
+                                  Just s  -> (text ": " <>) <$>
+                                              getInlines s
+                                  Nothing -> return mempty
+                     addMeta "title" (tit <> subtit)
+
+         getAuthor = (:[]) <$> getInlines e >>= addMeta "author"
+         getAuthorGroup = do
+          let terms = filterChildren (named "author") e
+          mapM getInlines terms >>= addMeta "author"
+         getDate = getInlines e >>= addMeta "date"
          parseTable = do
                       let isCaption x = named "title" x || named "caption" x
                       caption <- case filterChild isCaption e of
                                        Just t  -> getInlines t
                                        Nothing -> return mempty
-                      let e' = maybe e id $ filterChild (named "tgroup") e
+                      let e' = fromMaybe e $ filterChild (named "tgroup") e
                       let isColspec x = named "colspec" x || named "col" x
                       let colspecs = case filterChild (named "colgroup") e' of
                                            Just c -> filterChildren isColspec c
@@ -801,11 +836,14 @@ parseBlock (Elem e) =
                                                 Just "center" -> AlignCenter
                                                 _             -> AlignDefault
                       let toWidth c = case findAttr (unqual "colwidth") c of
-                                                Just w -> read $ filter (\x ->
+                                                Just w -> fromMaybe 0
+                                                   $ safeRead $ '0': filter (\x ->
                                                      (x >= '0' && x <= '9')
                                                       || x == '.') w
                                                 Nothing -> 0 :: Double
-                      let numrows = maximum $ map length bodyrows
+                      let numrows = case bodyrows of
+                                         []   -> 0
+                                         xs   -> maximum $ map length xs
                       let aligns = case colspecs of
                                      []  -> replicate numrows AlignDefault
                                      cs  -> map toAlignment cs
@@ -830,11 +868,21 @@ parseBlock (Elem e) =
                                       Nothing -> return mempty
                      modify $ \st -> st{ dbSectionLevel = n }
                      b <- getBlocks e
+                     let ident = attrValue "id" e
                      modify $ \st -> st{ dbSectionLevel = n - 1 }
-                     return $ header n' headerText <> b
+                     return $ headerWith (ident,[],[]) n' headerText <> b
+         metaBlock = acceptingMetadata (getBlocks e) >> return mempty
 
 getInlines :: Element -> DB Inlines
 getInlines e' = (trimInlines . mconcat) <$> (mapM parseInline $ elContent e')
+
+strContentRecursive :: Element -> String
+strContentRecursive = strContent .
+  (\e' -> e'{ elContent = map elementToStr $ elContent e' })
+
+elementToStr :: Content -> Content
+elementToStr (Elem e') = Text $ CData CDataText (strContentRecursive e') Nothing
+elementToStr x = x
 
 parseInline :: Content -> DB Inlines
 parseInline (Text (CData _ s _)) = return $ text s
@@ -842,6 +890,9 @@ parseInline (CRef ref) =
   return $ maybe (text $ map toUpper ref) (text . (:[])) $ lookupEntity ref
 parseInline (Elem e) =
   case qName (elName e) of
+        "equation" -> equation displayMath
+        "informalequation" -> equation displayMath
+        "inlineequation" -> equation math
         "subscript" -> subscript <$> innerInlines
         "superscript" -> superscript <$> innerInlines
         "inlinemediaobject" -> getImage e
@@ -856,6 +907,7 @@ parseInline (Elem e) =
                         else doubleQuoted contents
         "simplelist" -> simpleList
         "segmentedlist" -> segmentedList
+        "classname" -> codeWithLang
         "code" -> codeWithLang
         "filename" -> codeWithLang
         "literal" -> codeWithLang
@@ -875,17 +927,21 @@ parseInline (Elem e) =
         "constant" -> codeWithLang
         "userinput" -> codeWithLang
         "varargs" -> return $ code "(...)"
+        "keycap" -> return (str $ strContent e)
+        "keycombo" -> keycombo <$> (mapM parseInline $ elContent e)
+        "menuchoice" -> menuchoice <$> (mapM parseInline $
+                                        filter isGuiMenu $ elContent e)
         "xref" -> return $ str "?" -- so at least you know something is there
         "email" -> return $ link ("mailto:" ++ strContent e) ""
-                          $ code $ strContent e
-        "uri" -> return $ link (strContent e) "" $ code $ strContent e
+                          $ str $ strContent e
+        "uri" -> return $ link (strContent e) "" $ str $ strContent e
         "ulink" -> link (attrValue "url" e) "" <$> innerInlines
         "link" -> do
              ils <- innerInlines
              let href = case findAttr (QName "href" (Just "http://www.w3.org/1999/xlink") Nothing) e of
                                Just h -> h
                                _      -> ('#' : attrValue "linkend" e)
-             let ils' = if ils == mempty then code href else ils
+             let ils' = if ils == mempty then str href else ils
              return $ link href "" ils'
         "foreignphrase" -> emph <$> innerInlines
         "emphasis" -> case attrValue "role" e of
@@ -895,14 +951,26 @@ parseInline (Elem e) =
                              _        -> emph <$> innerInlines
         "footnote" -> (note . mconcat) <$> (mapM parseBlock $ elContent e)
         "title" -> return mempty
+        "affiliation" -> return mempty
+        -- Note: this isn't a real docbook tag; it's what we convert
+        -- <?asciidor-br?> to in handleInstructions, above.  A kludge to
+        -- work around xml-light's inability to parse an instruction.
+        "br" -> return linebreak
         _          -> innerInlines
    where innerInlines = (trimInlines . mconcat) <$>
                           (mapM parseInline $ elContent e)
+         equation constructor = return $ mconcat $
+           map (constructor . writeTeX)
+           $ rights
+           $ map (readMathML . showElement . everywhere (mkT removePrefix))
+           $ filterChildren (\x -> qName (elName x) == "math" &&
+                                   qPrefix (elName x) == Just "mml") e
+         removePrefix elname = elname { qPrefix = Nothing }
          codeWithLang = do
            let classes' = case attrValue "language" e of
                                "" -> []
                                l  -> [l]
-           return $ codeWith (attrValue "id" e,classes',[]) $ strContent e
+           return $ codeWith (attrValue "id" e,classes',[]) $ strContentRecursive e
          simpleList = (mconcat . intersperse (str "," <> space)) <$> mapM getInlines
                          (filterChildren (named "member") e)
          segmentedList = do
@@ -917,3 +985,10 @@ parseInline (Elem e) =
                          then mempty
                          else strong tit <> linebreak
            return $ linebreak <> tit' <> segs
+         keycombo = spanWith ("",["keycombo"],[]) .
+                    mconcat . intersperse (str "+")
+         menuchoice = spanWith ("",["menuchoice"],[]) .
+                    mconcat . intersperse (text " > ")
+         isGuiMenu (Elem x) = named "guimenu" x || named "guisubmenu" x ||
+                              named "guimenuitem" x
+         isGuiMenu _        = False

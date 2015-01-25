@@ -1,5 +1,6 @@
+{-# LANGUAGE OverloadedStrings #-}
 {-
-Copyright (C) 2008-2010 John MacFarlane and Peter Wang
+Copyright (C) 2008-2014 John MacFarlane and Peter Wang
 
 This program is free software; you can redistribute it and/or modify
 it under the terms of the GNU General Public License as published by
@@ -18,7 +19,7 @@ Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
 
 {- |
    Module      : Text.Pandoc.Writers.Texinfo
-   Copyright   : Copyright (C) 2008-2010 John MacFarlane and Peter Wang
+   Copyright   : Copyright (C) 2008-2014 John MacFarlane and Peter Wang
    License     : GNU GPL, version 2 or above
 
    Maintainer  : John MacFarlane <jgm@berkeley.edu>
@@ -31,14 +32,15 @@ module Text.Pandoc.Writers.Texinfo ( writeTexinfo ) where
 import Text.Pandoc.Definition
 import Text.Pandoc.Options
 import Text.Pandoc.Shared
-import Text.Pandoc.Templates (renderTemplate)
+import Text.Pandoc.Writers.Shared
+import Text.Pandoc.Templates (renderTemplate')
 import Text.Printf ( printf )
 import Data.List ( transpose, maximumBy )
 import Data.Ord ( comparing )
 import Data.Char ( chr, ord )
 import Control.Monad.State
 import Text.Pandoc.Pretty
-import Network.URI ( isAbsoluteURI, unEscapeString )
+import Network.URI ( isURI, unEscapeString )
 import System.FilePath
 
 data WriterState =
@@ -63,33 +65,32 @@ writeTexinfo options document =
 
 -- | Add a "Top" node around the document, needed by Texinfo.
 wrapTop :: Pandoc -> Pandoc
-wrapTop (Pandoc (Meta title authors date) blocks) =
-  Pandoc (Meta title authors date) (Header 0 title : blocks)
+wrapTop (Pandoc meta blocks) =
+  Pandoc meta (Header 0 nullAttr (docTitle meta) : blocks)
 
 pandocToTexinfo :: WriterOptions -> Pandoc -> State WriterState String
-pandocToTexinfo options (Pandoc (Meta title authors date) blocks) = do
-  titleText <- inlineListToTexinfo title
-  authorsText <- mapM inlineListToTexinfo authors
-  dateText <- inlineListToTexinfo date
-  let titlePage = not $ all null $ title : date : authors
-  main <- blockListToTexinfo blocks
-  st <- get
+pandocToTexinfo options (Pandoc meta blocks) = do
+  let titlePage = not $ all null
+                      $ docTitle meta : docDate meta : docAuthors meta
   let colwidth = if writerWrapText options
                     then Just $ writerColumns options
                     else Nothing
+  metadata <- metaToJSON options
+              (fmap (render colwidth) . blockListToTexinfo)
+              (fmap (render colwidth) . inlineListToTexinfo)
+              meta
+  main <- blockListToTexinfo blocks
+  st <- get
   let body = render colwidth main
-  let context = writerVariables options ++
-                [ ("body", body)
-                , ("title", render colwidth titleText)
-                , ("date", render colwidth dateText) ] ++
-                [ ("toc", "yes") | writerTableOfContents options ] ++
-                [ ("titlepage", "yes") | titlePage ] ++
-                [ ("subscript", "yes") | stSubscript st ] ++
-                [ ("superscript", "yes") | stSuperscript st ] ++
-                [ ("strikeout", "yes") | stStrikeout st ] ++
-                [ ("author", render colwidth a) | a <- authorsText ]
+  let context = defField "body" body
+              $ defField "toc" (writerTableOfContents options)
+              $ defField "titlepage" titlePage
+              $ defField "subscript" (stSubscript st)
+              $ defField "superscript" (stSuperscript st)
+              $ defField "strikeout" (stStrikeout st)
+              $ metadata
   if writerStandalone options
-     then return $ renderTemplate context $ writerTemplate options
+     then return $ renderTemplate' (writerTemplate options) context
      else return body
 
 -- | Escape things as needed for Texinfo.
@@ -123,10 +124,13 @@ blockToTexinfo :: Block     -- ^ Block to convert
 
 blockToTexinfo Null = return empty
 
+blockToTexinfo (Div _ bs) = blockListToTexinfo bs
+
 blockToTexinfo (Plain lst) =
   inlineListToTexinfo lst
 
-blockToTexinfo (Para [Image txt (src,tit)]) = do
+-- title beginning with fig: indicates that the image is a figure
+blockToTexinfo (Para [Image txt (src,'f':'i':'g':':':tit)]) = do
   capt <- if null txt
              then return empty
              else (\c -> text "@caption" <> braces c) `fmap`
@@ -149,10 +153,11 @@ blockToTexinfo (CodeBlock _ str) = do
            flush (text str) $$
            text "@end verbatim" <> blankline
 
-blockToTexinfo (RawBlock "texinfo" str) = return $ text str
-blockToTexinfo (RawBlock "latex" str) =
-  return $ text "@tex" $$ text str $$ text "@end tex"
-blockToTexinfo (RawBlock _ _) = return empty
+blockToTexinfo (RawBlock f str)
+  | f == "texinfo" = return $ text str
+  | f == "latex" || f == "tex" =
+                      return $ text "@tex" $$ text str $$ text "@end tex"
+  | otherwise      = return empty
 
 blockToTexinfo (BulletList lst) = do
   items <- mapM listItemToTexinfo lst
@@ -195,14 +200,14 @@ blockToTexinfo HorizontalRule =
 	     text (take 72 $ repeat '-') $$
              text "@end ifnottex"
 
-blockToTexinfo (Header 0 lst) = do
+blockToTexinfo (Header 0 _ lst) = do
   txt <- if null lst
             then return $ text "Top"
             else inlineListToTexinfo lst
   return $ text "@node Top" $$
            text "@top " <> txt <> blankline
 
-blockToTexinfo (Header level lst) = do
+blockToTexinfo (Header level _ lst) = do
   node <- inlineListForNode lst
   txt <- inlineListToTexinfo lst
   idsUsed <- gets stIdentifiers
@@ -286,9 +291,9 @@ blockListToTexinfo [] = return empty
 blockListToTexinfo (x:xs) = do
   x' <- blockToTexinfo x
   case x of
-    Header level _ -> do
+    Header level _ _ -> do
       -- We need need to insert a menu for this node.
-      let (before, after) = break isHeader xs
+      let (before, after) = break isHeaderBlock xs
       before' <- blockListToTexinfo before
       let menu = if level < 4
                     then collectNodes (level + 1) after
@@ -310,15 +315,11 @@ blockListToTexinfo (x:xs) = do
       xs' <- blockListToTexinfo xs
       return $ x' $$ xs'
 
-isHeader :: Block -> Bool
-isHeader (Header _ _) = True
-isHeader _            = False
-
 collectNodes :: Int -> [Block] -> [Block]
 collectNodes _ [] = []
 collectNodes level (x:xs) =
   case x of
-    (Header hl _) ->
+    (Header hl _ _) ->
       if hl < level
          then []
          else if hl == level
@@ -329,7 +330,7 @@ collectNodes level (x:xs) =
 
 makeMenuLine :: Block
              -> State WriterState Doc
-makeMenuLine (Header _ lst) = do
+makeMenuLine (Header _ _ lst) = do
   txt <- inlineListForNode lst
   return $ text "* " <> txt <> text "::"
 makeMenuLine _ = error "makeMenuLine called with non-Header block"
@@ -367,11 +368,14 @@ inlineListForNode = return . text . stringToTexinfo .
 
 -- periods, commas, colons, and parentheses are disallowed in node names
 disallowedInNode :: Char -> Bool
-disallowedInNode c = c `elem` ".,:()"
+disallowedInNode c = c `elem` (".,:()" :: String)
 
 -- | Convert inline element to Texinfo
 inlineToTexinfo :: Inline    -- ^ Inline to convert
                 -> State WriterState Doc
+
+inlineToTexinfo (Span _ lst) =
+  inlineListToTexinfo lst
 
 inlineToTexinfo (Emph lst) =
   inlineListToTexinfo lst >>= return . inCmd "emph"
@@ -412,10 +416,11 @@ inlineToTexinfo (Cite _ lst) =
   inlineListToTexinfo lst
 inlineToTexinfo (Str str) = return $ text (stringToTexinfo str)
 inlineToTexinfo (Math _ str) = return $ inCmd "math" $ text str
-inlineToTexinfo (RawInline f str) | f == "latex" || f == "tex" =
-  return $ text "@tex" $$ text str $$ text "@end tex"
-inlineToTexinfo (RawInline "texinfo" str) = return $ text str
-inlineToTexinfo (RawInline _ _) = return empty
+inlineToTexinfo (RawInline f str)
+  | f == "latex" || f == "tex" =
+                      return $ text "@tex" $$ text str $$ text "@end tex"
+  | f == "texinfo" =  return $ text str
+  | otherwise      =  return empty
 inlineToTexinfo (LineBreak) = return $ text "@*"
 inlineToTexinfo Space = return $ char ' '
 
@@ -425,7 +430,7 @@ inlineToTexinfo (Link txt (src@('#':_), _)) = do
            braces (text (stringToTexinfo src) <> text "," <> contents)
 inlineToTexinfo (Link txt (src, _)) = do
   case txt of
-        [Code _ x] | x == src ->  -- autolink
+        [Str x] | escapeURI x == src ->  -- autolink
              do return $ text $ "@url{" ++ x ++ "}"
         _ -> do contents <- escapeCommas $ inlineListToTexinfo txt
                 let src1 = stringToTexinfo src
@@ -439,7 +444,7 @@ inlineToTexinfo (Image alternate (source, _)) = do
   where
     ext     = drop 1 $ takeExtension source'
     base    = dropExtension source'
-    source' = if isAbsoluteURI source
+    source' = if isURI source
                  then source
                  else unEscapeString source
 

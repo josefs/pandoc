@@ -105,7 +105,7 @@ H<sub>2</sub>O base<sup>''exponent''</sup>
 
 == inline code ==
 
-<code>*&rarr;*</code> <tt>typed</tt> <hask>&gt;&gt;=</hask>
+<code>*→*</code> <tt>typed</tt> <hask>>>=</hask>
 
 == code blocks ==
 
@@ -173,6 +173,8 @@ http://johnmacfarlane.net/pandoc/
 
 [[File:example.jpg]]
 
+[[Archivo:example_es.jpg]]
+
 == lists ==
 
 * Start each line
@@ -182,6 +184,9 @@ http://johnmacfarlane.net/pandoc/
 * Line breaks<br/>don't break levels.
 *** But jumping levels creates empty space.
 Any other start ends the list.
+
+** two
+* one
 
 # Start each line
 # with a number sign (#).
@@ -232,11 +237,11 @@ ends the list.
   <li>list item A2</li>
 </ol>
 
-<ul>
+<ol>
 #abc
 #def
 #ghi
-</ul>
+</ol>
 
 <ol start="9">
 <li>Amsterdam</li>
@@ -247,6 +252,8 @@ ends the list.
 == math ==
 
 Here is some <math>x=\frac{y^\pi}{z}</math>.
+
+With spaces: <math> x=\frac{y^\pi}{z} </math>.
 
 == preformatted blocks ==
 
@@ -273,6 +280,10 @@ def function():
         print False</nowiki>
 
 Not<hr/> preformatted
+
+Don't need
+ a blank line
+around a preformatted block.
 
 == templates ==
 
@@ -362,8 +373,12 @@ and cheese
 |Ice cream
 |}
 
+{|
+|Orange
+|}Paragraph after the table.
 
 == notes ==
 
 My note!<ref>This.</ref>
 
+URL note.<ref>http://docs.python.org/library/functions.html#range</ref>

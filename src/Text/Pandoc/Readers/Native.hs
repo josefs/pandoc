@@ -1,5 +1,5 @@
 {-
-Copyright (C) 2011 John MacFarlane <jgm@berkeley.edu>
+Copyright (C) 2011-2014 John MacFarlane <jgm@berkeley.edu>
 
 This program is free software; you can redistribute it and/or modify
 it under the terms of the GNU General Public License as published by
@@ -18,7 +18,7 @@ Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
 
 {- |
    Module      : Text.Pandoc.Readers.Native
-   Copyright   : Copyright (C) 2011 John MacFarlane
+   Copyright   : Copyright (C) 2011-2014 John MacFarlane
    License     : GNU GPL, version 2 or above
 
    Maintainer  : John MacFarlane <jgm@berkeley.edu>
@@ -33,12 +33,6 @@ module Text.Pandoc.Readers.Native ( readNative ) where
 import Text.Pandoc.Definition
 import Text.Pandoc.Shared (safeRead)
 
-nullMeta :: Meta
-nullMeta = Meta{ docTitle = []
-               , docAuthors = []
-               , docDate = []
-               }
-
 -- | Read native formatted text and return a Pandoc document.
 -- The input may be a full pandoc document, a block list, a block,
 -- an inline list, or an inline.  Thus, for example,
@@ -47,7 +41,7 @@ nullMeta = Meta{ docTitle = []
 --
 -- will be treated as if it were
 --
--- > Pandoc (Meta [] [] []) [Plain [Str "hi"]]
+-- > Pandoc nullMeta [Plain [Str "hi"]]
 --
 readNative :: String      -- ^ String to parse (assuming @'\n'@ line endings)
            -> Pandoc

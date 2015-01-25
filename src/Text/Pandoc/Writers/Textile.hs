@@ -1,5 +1,5 @@
 {-
-Copyright (C) 2010 John MacFarlane <jgm@berkeley.edu>
+Copyright (C) 2010-2014 John MacFarlane <jgm@berkeley.edu>
 
 This program is free software; you can redistribute it and/or modify
 it under the terms of the GNU General Public License as published by
@@ -18,7 +18,7 @@ Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
 
 {- |
    Module      : Text.Pandoc.Writers.Textile
-   Copyright   : Copyright (C) 2010 John MacFarlane
+   Copyright   : Copyright (C) 2010-2014 John MacFarlane
    License     : GNU GPL, version 2 or above
 
    Maintainer  : John MacFarlane <jgm@berkeley.edu>
@@ -33,10 +33,13 @@ module Text.Pandoc.Writers.Textile ( writeTextile ) where
 import Text.Pandoc.Definition
 import Text.Pandoc.Options
 import Text.Pandoc.Shared
-import Text.Pandoc.Templates (renderTemplate)
+import Text.Pandoc.Pretty (render)
+import Text.Pandoc.Writers.Shared
+import Text.Pandoc.Templates (renderTemplate')
 import Text.Pandoc.XML ( escapeStringForXML )
 import Data.List ( intercalate )
 import Control.Monad.State
+import Control.Applicative ((<$>))
 import Data.Char ( isSpace )
 
 data WriterState = WriterState {
@@ -49,17 +52,19 @@ data WriterState = WriterState {
 writeTextile :: WriterOptions -> Pandoc -> String
 writeTextile opts document =
   evalState (pandocToTextile opts document)
-            (WriterState { stNotes = [], stListLevel = [], stUseTags = False })
+            WriterState { stNotes = [], stListLevel = [], stUseTags = False }
 
 -- | Return Textile representation of document.
 pandocToTextile :: WriterOptions -> Pandoc -> State WriterState String
-pandocToTextile opts (Pandoc _ blocks) = do
+pandocToTextile opts (Pandoc meta blocks) = do
+  metadata <- metaToJSON opts (blockListToTextile opts)
+                 (inlineListToTextile opts) meta
   body <- blockListToTextile opts blocks
   notes <- liftM (unlines . reverse . stNotes) get
   let main = body ++ if null notes then "" else ("\n\n" ++ notes)
-  let context = writerVariables opts ++ [ ("body", main) ]
+  let context = defField "body" main metadata
   if writerStandalone opts
-     then return $ renderTemplate context $ writerTemplate opts
+     then return $ renderTemplate' (writerTemplate opts) context
      else return main
 
 withUseTags :: State WriterState a -> State WriterState a
@@ -98,10 +103,17 @@ blockToTextile :: WriterOptions -- ^ Options
 
 blockToTextile _ Null = return ""
 
+blockToTextile opts (Div attr bs) = do
+  let startTag = render Nothing $ tagWithAttrs "div" attr
+  let endTag = "</div>"
+  contents <- blockListToTextile opts bs
+  return $ startTag ++ "\n\n" ++ contents ++ "\n\n" ++ endTag ++ "\n"
+
 blockToTextile opts (Plain inlines) =
   inlineListToTextile opts inlines
 
-blockToTextile opts (Para [Image txt (src,tit)]) = do
+-- title beginning with fig: indicates that the image is a figure
+blockToTextile opts (Para [Image txt (src,'f':'i':'g':':':tit)]) = do
   capt <- blockToTextile opts (Para txt)
   im <- inlineToTextile opts (Image txt (src,tit))
   return $ im ++ "\n" ++ capt
@@ -114,16 +126,21 @@ blockToTextile opts (Para inlines) = do
               then "<p>" ++ contents ++ "</p>"
               else contents ++ if null listLevel then "\n" else ""
 
-blockToTextile _ (RawBlock f str) =
-  if f == "html" || f == "textile"
-     then return str
-     else return ""
+blockToTextile _ (RawBlock f str)
+  | f == Format "html" || f == Format "textile" = return str
+  | otherwise                                   = return ""
 
 blockToTextile _ HorizontalRule = return "<hr />\n"
 
-blockToTextile opts (Header level inlines) = do
+blockToTextile opts (Header level (ident,classes,keyvals) inlines) = do
   contents <- inlineListToTextile opts inlines
-  let prefix = 'h' : (show level ++ ". ")
+  let identAttr = if null ident then "" else ('#':ident)
+  let attribs = if null identAttr && null classes
+                   then ""
+                   else "(" ++ unwords classes ++ identAttr ++ ")"
+  let lang = maybe "" (\x -> "[" ++ x ++ "]") $ lookup "lang" keyvals
+  let styles = maybe "" (\x -> "{" ++ x ++ "}") $ lookup "style" keyvals
+  let prefix = 'h' : show level ++ attribs ++ styles ++ lang ++ ". "
   return $ prefix ++ contents ++ "\n"
 
 blockToTextile _ (CodeBlock (_,classes,_) str) | any (all isSpace) (lines str) =
@@ -148,14 +165,22 @@ blockToTextile opts (BlockQuote blocks) = do
   return $ "<blockquote>\n\n" ++ contents ++ "\n</blockquote>\n"
 
 blockToTextile opts (Table [] aligns widths headers rows') |
-         all (==0) widths && all (`elem` [AlignLeft,AlignDefault]) aligns = do
+         all (==0) widths = do
   hs <- mapM (liftM (("_. " ++) . stripTrailingNewlines) . blockListToTextile opts) headers
   let cellsToRow cells = "|" ++ intercalate "|" cells ++ "|"
-  let header = if all null headers then "" else cellsToRow hs
-  let rowToCells = mapM (liftM stripTrailingNewlines . blockListToTextile opts)
+  let header = if all null headers then "" else cellsToRow hs ++ "\n"
+  let blocksToCell (align, bs) = do
+        contents <- stripTrailingNewlines <$> blockListToTextile opts bs
+        let alignMarker = case align of
+                               AlignLeft    -> "<. "
+                               AlignRight   -> ">. "
+                               AlignCenter  -> "=. "
+                               AlignDefault -> ""
+        return $ alignMarker ++ contents
+  let rowToCells = mapM blocksToCell . zip aligns
   bs <- mapM rowToCells rows'
   let body = unlines $ map cellsToRow bs
-  return $ header ++ "\n" ++ body ++ "\n"
+  return $ header ++ body
 
 blockToTextile opts (Table capt aligns widths headers rows') = do
   let alignStrings = map alignmentToString aligns
@@ -333,6 +358,9 @@ inlineListToTextile opts lst =
 -- | Convert Pandoc inline element to Textile.
 inlineToTextile :: WriterOptions -> Inline -> State WriterState String
 
+inlineToTextile opts (Span _ lst) =
+  inlineListToTextile opts lst
+
 inlineToTextile opts (Emph lst) = do
   contents <- inlineListToTextile opts lst
   return $ if '_' `elem` contents
@@ -385,10 +413,11 @@ inlineToTextile _ (Str str) = return $ escapeStringForTextile str
 inlineToTextile _ (Math _ str) =
   return $ "<span class=\"math\">" ++ escapeStringForXML str ++ "</math>"
 
-inlineToTextile _ (RawInline f str) =
-  if f == "html" || f == "textile"
-     then return str
-     else return ""
+inlineToTextile opts (RawInline f str)
+  | f == Format "html" || f == Format "textile" = return str
+  | (f == Format "latex" || f == Format "tex") &&
+     isEnabled Ext_raw_tex opts                 = return str
+  | otherwise                                   = return ""
 
 inlineToTextile _ (LineBreak) = return "\n"
 
@@ -396,7 +425,10 @@ inlineToTextile _ Space = return " "
 
 inlineToTextile opts (Link txt (src, _)) = do
   label <- case txt of
-                [Code _ s]  -> return s
+                [Code _ s]
+                 | s == src -> return "$"
+                [Str s]
+                 | s == src -> return "$"
                 _           -> inlineListToTextile opts txt
   return $ "\"" ++ label ++ "\":" ++ src
 

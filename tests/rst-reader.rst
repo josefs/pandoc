@@ -3,8 +3,7 @@ Pandoc Test Suite
 Subtitle
 ^^^^^^^^
 
-:Author: John MacFarlane
-:Author: Anonymous
+:Authors: John MacFarlane; Anonymous
 :Date: July 17, 2006
 :Revision: 3
 
@@ -454,7 +453,7 @@ Line blocks
 |     or not to be an entire bee,
 |         when half the bee is not a bee,
 |             due to some ancient injury?
-
+|
 | Continuation
  line
 |   and
@@ -599,6 +598,30 @@ Reset default-role to the default default.
 .. default-role::
 
 And now `some-invalid-string-3231231` is nonsense.
+
+.. role:: html(raw)
+   :format: html
+
+And now with :html:`<b>inline</b> <span id="test">HTML</span>`.
+
+.. role:: haskell(code)
+   :language: haskell
+
+And some inline haskell :haskell:`fmap id [1,2..10]`.
+
+.. role:: indirect(code)
+
+.. role:: python(indirect)
+   :language: python
+
+Indirect python role :python:`[x*x for x in [1,2,3,4,5]]`.
+
+.. role:: different-indirect(code)
+   :language: c
+
+.. role:: c(different-indirect)
+
+Different indirect C :c:`int x = 15;`.
 
 Literal symbols
 ---------------

@@ -1,6 +1,6 @@
 {-# LANGUAGE OverloadedStrings #-}
 {-
-Copyright (C) 2011 John MacFarlane <jgm@berkeley.edu>
+Copyright (C) 2011-2014 John MacFarlane <jgm@berkeley.edu>
 
 This program is free software; you can redistribute it and/or modify
 it under the terms of the GNU General Public License as published by
@@ -19,7 +19,7 @@ Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
 
 {- |
    Module      : Text.Pandoc.SelfContained
-   Copyright   : Copyright (C) 2011 John MacFarlane
+   Copyright   : Copyright (C) 2011-2014 John MacFarlane
    License     : GNU GPL, version 2 or above
 
    Maintainer  : John MacFarlane <jgm@berkeley.edu>
@@ -32,88 +32,59 @@ the HTML using data URIs.
 -}
 module Text.Pandoc.SelfContained ( makeSelfContained ) where
 import Text.HTML.TagSoup
-import Network.URI (isAbsoluteURI, parseURI, escapeURIString)
-import Network.HTTP
+import Network.URI (isURI, escapeURIString, URI(..), parseURI)
 import Data.ByteString.Base64
 import qualified Data.ByteString.Char8 as B
 import Data.ByteString (ByteString)
-import System.FilePath (takeExtension, dropExtension, takeDirectory, (</>))
+import System.FilePath (takeExtension, takeDirectory, (</>))
 import Data.Char (toLower, isAscii, isAlphaNum)
 import Codec.Compression.GZip as Gzip
 import qualified Data.ByteString.Lazy as L
-import Text.Pandoc.Shared (findDataFile, renderTags')
-import Text.Pandoc.MIME (getMimeType)
-import System.Directory (doesFileExist)
+import Text.Pandoc.Shared (renderTags', err, fetchItem')
+import Text.Pandoc.MediaBag (MediaBag)
+import Text.Pandoc.MIME (MimeType)
 import Text.Pandoc.UTF8 (toString,  fromString)
-
-getItem :: Maybe FilePath -> String -> IO (ByteString, Maybe String)
-getItem userdata f =
-  if isAbsoluteURI f
-     then openURL f
-     else do
-       let mime = case takeExtension f of
-                      ".gz" -> getMimeType $ dropExtension f
-                      x     -> getMimeType x
-       exists <- doesFileExist f
-       if exists
-          then do
-            cont <- B.readFile f
-            return (cont, mime)
-          else do
-            res <- findDataFile userdata f
-            exists' <- doesFileExist res
-            if exists'
-               then do
-                 cont <- B.readFile res
-                 return (cont, mime)
-               else error $ "Could not find `" ++ f ++ "'"
-
--- TODO - have this return mime type too - then it can work for google
--- chart API, e.g.
-openURL :: String -> IO (ByteString, Maybe String)
-openURL u = getBodyAndMimeType =<< simpleHTTP (getReq u)
-  where getReq v = case parseURI v of
-                     Nothing  -> error $ "Could not parse URI: " ++ v
-                     Just u'  -> mkRequest GET u'
-        getBodyAndMimeType (Left err) = fail (show err)
-        getBodyAndMimeType (Right r)  = return (rspBody r, findHeader HdrContentType r)
+import Text.Pandoc.Options (WriterOptions(..))
 
 isOk :: Char -> Bool
 isOk c = isAscii c && isAlphaNum c
 
-convertTag :: Maybe FilePath -> Tag String -> IO (Tag String)
-convertTag userdata t@(TagOpen "img" as) =
-       case fromAttrib "src" t of
-         []   -> return t
-         src  -> do
-           (raw, mime) <- getRaw userdata (fromAttrib "type" t) src
-           let enc = "data:" ++ mime ++ ";base64," ++ toString (encode raw)
-           return $ TagOpen "img" (("src",enc) : [(x,y) | (x,y) <- as, x /= "src"])
-convertTag userdata t@(TagOpen "video" as) =
-       case fromAttrib "src" t of
-         []   -> return t
-         src  -> do
-           (raw, mime) <- getRaw userdata (fromAttrib "type" t) src
-           let enc = "data:" ++ mime ++ ";base64," ++ toString (encode raw)
-           return $ TagOpen "video" (("src",enc) : [(x,y) | (x,y) <- as, x /= "src"])
-convertTag userdata t@(TagOpen "script" as) =
+convertTag :: MediaBag -> Maybe String -> Tag String -> IO (Tag String)
+convertTag media sourceURL t@(TagOpen tagname as)
+  | tagname `elem`
+     ["img", "embed", "video", "input", "audio", "source", "track"] = do
+       as' <- mapM processAttribute as
+       return $ TagOpen tagname as'
+  where processAttribute (x,y) =
+           if x == "src" || x == "href" || x == "poster"
+              then do
+                (raw, mime) <- getRaw media sourceURL (fromAttrib "type" t) y
+                let enc = "data:" ++ mime ++ ";base64," ++ toString (encode raw)
+                return (x, enc)
+              else return (x,y)
+convertTag media sourceURL t@(TagOpen "script" as) =
   case fromAttrib "src" t of
        []     -> return t
        src    -> do
-           (raw, mime) <- getRaw userdata (fromAttrib "type" t) src
-           let enc = "data:" ++ mime ++ "," ++ escapeURIString isOk (toString raw)
+           (raw, mime) <- getRaw media sourceURL (fromAttrib "type" t) src
+           let mime' = if ';' `elem` mime
+                          then mime  -- mime type already has charset
+                          else mime ++ ";charset=utf-8"
+           let enc = "data:" ++ mime' ++ "," ++ escapeURIString isOk (toString raw)
            return $ TagOpen "script" (("src",enc) : [(x,y) | (x,y) <- as, x /= "src"])
-convertTag userdata t@(TagOpen "link" as) =
+convertTag media sourceURL t@(TagOpen "link" as) =
   case fromAttrib "href" t of
        []  -> return t
        src -> do
-           (raw, mime) <- getRaw userdata (fromAttrib "type" t) src
+           (raw, mime) <- getRaw media sourceURL (fromAttrib "type" t) src
            let enc = "data:" ++ mime ++ "," ++ escapeURIString isOk (toString raw)
            return $ TagOpen "link" (("href",enc) : [(x,y) | (x,y) <- as, x /= "href"])
-convertTag _ t = return t
+convertTag _ _ t = return t
 
-cssURLs :: Maybe FilePath -> FilePath -> ByteString -> IO ByteString
-cssURLs userdata d orig =
+-- NOTE: This is really crude, it doesn't respect CSS comments.
+cssURLs :: MediaBag -> Maybe String -> FilePath -> ByteString
+        -> IO ByteString
+cssURLs media sourceURL d orig =
   case B.breakSubstring "url(" orig of
        (x,y) | B.null y  -> return orig
              | otherwise -> do
@@ -123,19 +94,24 @@ cssURLs userdata d orig =
                                  "\"" -> B.takeWhile (/='"') $ B.drop 1 u
                                  "'"  -> B.takeWhile (/='\'') $ B.drop 1 u
                                  _    -> u
-                  let url' = if isAbsoluteURI url
+                  let url' = if isURI url
                                 then url
                                 else d </> url
-                  (raw, mime) <- getRaw userdata "" url'
-                  rest <- cssURLs userdata d v
+                  (raw, mime) <- getRaw media sourceURL "" url'
+                  rest <- cssURLs media sourceURL d v
                   let enc = "data:" `B.append` fromString mime `B.append`
                                ";base64," `B.append` (encode raw)
                   return $ x `B.append` "url(" `B.append` enc `B.append` rest
 
-getRaw :: Maybe FilePath -> String -> String -> IO (ByteString, String)
-getRaw userdata mimetype src = do
+getRaw :: MediaBag -> Maybe String -> MimeType -> String
+       -> IO (ByteString, MimeType)
+getRaw media sourceURL mimetype src = do
   let ext = map toLower $ takeExtension src
-  (raw, respMime) <- getItem userdata src
+  fetchResult <- fetchItem' media sourceURL src
+  (raw, respMime) <- case fetchResult of
+                          Left msg -> err 67 $ "Could not fetch " ++ src ++
+                                               "\n" ++ show msg
+                          Right x  -> return x
   let raw' = if ext == ".gz"
                 then B.concat $ L.toChunks $ Gzip.decompress $ L.fromChunks
                       $ [raw]
@@ -145,21 +121,22 @@ getRaw userdata mimetype src = do
                          $ "Could not determine mime type for `" ++ src ++ "'"
                   (x, Nothing) -> x
                   (_, Just x ) -> x
+  let cssSourceURL = case parseURI src of
+                          Just u
+                            | uriScheme u `elem` ["http:","https:"] ->
+                                Just $ show u{ uriPath = "",
+                                               uriQuery = "",
+                                               uriFragment = "" }
+                          _ -> Nothing
   result <- if mime == "text/css"
-               then cssURLs userdata (takeDirectory src) raw'
+               then cssURLs media cssSourceURL (takeDirectory src) raw'
                else return raw'
   return (result, mime)
 
 -- | Convert HTML into self-contained HTML, incorporating images,
--- scripts, and CSS using data: URIs.  Items specified using absolute
--- URLs will be downloaded; those specified using relative URLs will
--- be sought first relative to the working directory, then relative
--- to the user data directory (if the first parameter is 'Just'
--- a directory), and finally relative to pandoc's default data
--- directory.
-makeSelfContained :: Maybe FilePath -> String -> IO String
-makeSelfContained userdata inp = do
+-- scripts, and CSS using data: URIs.
+makeSelfContained :: WriterOptions -> String -> IO String
+makeSelfContained opts inp = do
   let tags = parseTags inp
-  out' <- mapM (convertTag userdata) tags
+  out' <- mapM (convertTag (writerMediaBag opts) (writerSourceURL opts)) tags
   return $ renderTags' out'
-

@@ -1,4 +1,4 @@
-.TH Pandoc "" "July 17, 2006" "Test Suite"
+.TH "Pandoc Test Suite" "" "July 17, 2006" "" ""
 .PP
 This is a set of tests for pandoc.
 Most of them are adapted from John Gruber's markdown test suite.
@@ -450,6 +450,7 @@ Simple block on one line:
 foo
 .PP
 And nested without indentation:
+.PP
 foo
 bar
 .PP
@@ -458,6 +459,7 @@ This is \f[I]emphasized\f[]
 And this is \f[B]strong\f[]
 .PP
 Here's a simple block:
+.PP
 foo
 .PP
 This should be a code block, though:
@@ -572,7 +574,7 @@ Ellipses\&...and\&...and\&....
 .IP \[bu] 2
 Here's some display math:
 .RS
-$\\frac{d}{dx}f(x)=\\lim_{h\\to 0}\\frac{f(x+h)\-f(x)}{h}$
+$$\\frac{d}{dx}f(x)=\\lim_{h\\to 0}\\frac{f(x+h)\-f(x)}{h}$$
 .RE
 .IP \[bu] 2
 Here's one that has a line break in it:

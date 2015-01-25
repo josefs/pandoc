@@ -1,6 +1,6 @@
-{-# LANGUAGE OverloadedStrings, TupleSections #-}
+{-# LANGUAGE OverloadedStrings, TupleSections, ScopedTypeVariables #-}
 {-
-Copyright (C) 2006-2010 John MacFarlane <jgm@berkeley.edu>
+Copyright (C) 2006-2014 John MacFarlane <jgm@berkeley.edu>
 
 This program is free software; you can redistribute it and/or modify
 it under the terms of the GNU General Public License as published by
@@ -19,7 +19,7 @@ Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
 
 {- |
    Module      : Text.Pandoc.Writers.Markdown
-   Copyright   : Copyright (C) 2006-2010 John MacFarlane
+   Copyright   : Copyright (C) 2006-2014 John MacFarlane
    License     : GNU GPL, version 2 or above
 
    Maintainer  : John MacFarlane <jgm@berkeley.edu>
@@ -32,24 +32,37 @@ Markdown:  <http://daringfireball.net/projects/markdown/>
 -}
 module Text.Pandoc.Writers.Markdown (writeMarkdown, writePlain) where
 import Text.Pandoc.Definition
-import Text.Pandoc.Generic
-import Text.Pandoc.Templates (renderTemplate)
+import Text.Pandoc.Walk
+import Text.Pandoc.Templates (renderTemplate')
 import Text.Pandoc.Shared
+import Text.Pandoc.Writers.Shared
 import Text.Pandoc.Options
-import Text.Pandoc.Parsing hiding (blankline, char, space)
-import Data.List ( group, isPrefixOf, find, intersperse, transpose )
+import Text.Pandoc.Parsing hiding (blankline, blanklines, char, space)
+import Data.Maybe (fromMaybe)
+import Data.List ( group, stripPrefix, find, intersperse, transpose, sortBy )
+import Data.Char ( isSpace, isPunctuation )
+import Data.Ord ( comparing )
 import Text.Pandoc.Pretty
 import Control.Monad.State
 import qualified Data.Set as Set
 import Text.Pandoc.Writers.HTML (writeHtmlString)
-import Text.Pandoc.Readers.TeXMath (readTeXMath)
-import Text.HTML.TagSoup (renderTags, parseTags, isTagText, Tag(..))
+import Text.Pandoc.Readers.TeXMath (texMathToInlines)
+import Text.HTML.TagSoup (parseTags, isTagText, Tag(..))
+import Network.URI (isURI)
+import Data.Default
+import Data.Yaml (Value(Object,String,Array,Bool,Number))
+import qualified Data.HashMap.Strict as H
+import qualified Data.Vector as V
+import qualified Data.Text as T
 
 type Notes = [[Block]]
 type Refs = [([Inline], Target)]
 data WriterState = WriterState { stNotes :: Notes
-                               , stRefs :: Refs
+                               , stRefs  :: Refs
+                               , stIds   :: [String]
                                , stPlain :: Bool }
+instance Default WriterState
+  where def = WriterState{ stNotes = [], stRefs = [], stIds = [], stPlain = False }
 
 -- | Convert Pandoc to Markdown.
 writeMarkdown :: WriterOptions -> Pandoc -> String
@@ -57,9 +70,7 @@ writeMarkdown opts document =
   evalState (pandocToMarkdown opts{
                   writerWrapText = writerWrapText opts &&
                   not (isEnabled Ext_hard_line_breaks opts) }
-             document) WriterState{ stNotes = []
-                                  , stRefs  = []
-                                  , stPlain = False }
+             document) def
 
 -- | Convert Pandoc to plain text (like markdown, but without links,
 -- pictures, or inline formatting).
@@ -67,40 +78,42 @@ writePlain :: WriterOptions -> Pandoc -> String
 writePlain opts document =
   evalState (pandocToMarkdown opts{
                  writerExtensions = Set.delete Ext_escaped_line_breaks $
+                                    Set.delete Ext_pipe_tables $
+                                    Set.delete Ext_raw_html $
+                                    Set.delete Ext_markdown_in_html_blocks $
+                                    Set.delete Ext_raw_tex $
+                                    Set.delete Ext_footnotes $
+                                    Set.delete Ext_tex_math_dollars $
+                                    Set.delete Ext_citations $
                                     writerExtensions opts }
-              document') WriterState{ stNotes = []
-                                    , stRefs  = []
-                                    , stPlain = True }
-    where document' = plainify document
-
-plainify :: Pandoc -> Pandoc
-plainify = bottomUp go
-  where go :: Inline -> Inline
-        go (Emph xs) = SmallCaps xs
-        go (Strong xs) = SmallCaps xs
-        go (Strikeout xs) = SmallCaps xs
-        go (Superscript xs) = SmallCaps xs
-        go (Subscript xs) = SmallCaps xs
-        go (SmallCaps xs) = SmallCaps xs
-        go (Code _ s) = Str s
-        go (Math _ s) = Str s
-        go (RawInline _ _) = Str ""
-        go (Link xs _) = SmallCaps xs
-        go (Image xs _) = SmallCaps $ [Str "["] ++ xs ++ [Str "]"]
-        go (Cite _ cits) = SmallCaps cits
-        go x = x
+              document) def{ stPlain = True }
 
 pandocTitleBlock :: Doc -> [Doc] -> Doc -> Doc
 pandocTitleBlock tit auths dat =
   hang 2 (text "% ") tit <> cr <>
-  hang 2 (text "% ") (hcat (intersperse (text "; ") auths)) <> cr <>
+  hang 2 (text "% ") (vcat $ map nowrap auths) <> cr <>
   hang 2 (text "% ") dat <> cr
 
-mmdTitleBlock :: Doc -> [Doc] -> Doc -> Doc
-mmdTitleBlock tit auths dat =
-  hang 8 (text "Title:  ") tit <> cr <>
-  hang 8 (text "Author: ") (hcat (intersperse (text "; ") auths)) <> cr <>
-  hang 8 (text "Date:   ") dat <> cr
+mmdTitleBlock :: Value -> Doc
+mmdTitleBlock (Object hashmap) =
+  vcat $ map go $ sortBy (comparing fst) $ H.toList hashmap
+  where go (k,v) =
+          case (text (T.unpack k), v) of
+               (k', Array vec)
+                 | V.null vec     -> empty
+                 | otherwise      -> k' <> ":" <> space <>
+                                      hcat (intersperse "; "
+                                           (map fromstr $ V.toList vec))
+               (_, String "")  -> empty
+               (k', x)         -> k' <> ":" <> space <> nest 2 (fromstr x)
+        fromstr (String s) = text (removeBlankLines $ T.unpack s)
+        fromstr (Bool b)   = text (show b)
+        fromstr (Number n) = text (show n)
+        fromstr _          = empty
+        -- blank lines not allowed in MMD metadata - we replace with .
+        removeBlankLines   = trimr . unlines . map (\x ->
+                               if all isSpace x then "." else x) . lines
+mmdTitleBlock _ = empty
 
 plainTitleBlock :: Doc -> [Doc] -> Doc -> Doc
 plainTitleBlock tit auths dat =
@@ -108,44 +121,85 @@ plainTitleBlock tit auths dat =
   (hcat (intersperse (text "; ") auths)) <> cr <>
   dat <> cr
 
+yamlMetadataBlock :: Value -> Doc
+yamlMetadataBlock v = "---" $$ (jsonToYaml v) $$ "..."
+
+jsonToYaml :: Value -> Doc
+jsonToYaml (Object hashmap) =
+  vcat $ map (\(k,v) ->
+          case (text (T.unpack k), v, jsonToYaml v) of
+               (k', Array vec, x)
+                 | V.null vec     -> empty
+                 | otherwise      -> (k' <> ":") $$ x
+               (k', Object _, x)  -> (k' <> ":") $$ nest 2 x
+               (_, String "", _)  -> empty
+               (k', _, x)         -> k' <> ":" <> space <> hang 2 "" x)
+       $ sortBy (comparing fst) $ H.toList hashmap
+jsonToYaml (Array vec) =
+  vcat $ map (\v -> hang 2 "- " (jsonToYaml v)) $ V.toList vec
+jsonToYaml (String "") = empty
+jsonToYaml (String s) =
+  case T.unpack s of
+     x | '\n' `elem` x -> hang 2 ("|" <> cr) $ text x
+       | not (any isPunctuation x) -> text x
+       | otherwise     -> text $ "'" ++ substitute "'" "''" x ++ "'"
+jsonToYaml (Bool b) = text $ show b
+jsonToYaml (Number n) = text $ show n
+jsonToYaml _ = empty
+
 -- | Return markdown representation of document.
 pandocToMarkdown :: WriterOptions -> Pandoc -> State WriterState String
-pandocToMarkdown opts (Pandoc (Meta title authors date) blocks) = do
-  title' <- inlineListToMarkdown opts title
-  authors' <- mapM (inlineListToMarkdown opts) authors
-  date' <- inlineListToMarkdown opts date
+pandocToMarkdown opts (Pandoc meta blocks) = do
+  let colwidth = if writerWrapText opts
+                    then Just $ writerColumns opts
+                    else Nothing
   isPlain <- gets stPlain
-  let titleblock = case True of
-                        _ | isPlain ->
-                              plainTitleBlock title' authors' date'
-                          | isEnabled Ext_pandoc_title_block opts ->
-                              pandocTitleBlock title' authors' date'
-                          | isEnabled Ext_mmd_title_block opts ->
-                              mmdTitleBlock title' authors' date'
-                          | otherwise -> empty
+  metadata <- metaToJSON opts
+               (fmap (render colwidth) . blockListToMarkdown opts)
+               (fmap (render colwidth) . inlineListToMarkdown opts)
+               meta
+  let title' = maybe empty text $ getField "title" metadata
+  let authors' = maybe [] (map text) $ getField "author" metadata
+  let date' = maybe empty text $ getField "date" metadata
+  let titleblock = case writerStandalone opts of
+                        True | isPlain ->
+                                plainTitleBlock title' authors' date'
+                             | isEnabled Ext_yaml_metadata_block opts ->
+                                 yamlMetadataBlock metadata
+                             | isEnabled Ext_pandoc_title_block opts ->
+                                 pandocTitleBlock title' authors' date'
+                             | isEnabled Ext_mmd_title_block opts ->
+                                 mmdTitleBlock metadata
+                             | otherwise -> empty
+                        False -> empty
   let headerBlocks = filter isHeaderBlock blocks
   let toc = if writerTableOfContents opts
                then tableOfContents opts headerBlocks
                else empty
-  body <- blockListToMarkdown opts blocks
+  -- Strip off final 'references' header if markdown citations enabled
+  let blocks' = if isEnabled Ext_citations opts
+                   then case reverse blocks of
+                             (Div (_,["references"],_) _):xs -> reverse xs
+                             _ -> blocks
+                   else blocks
+  body <- blockListToMarkdown opts blocks'
   st <- get
   notes' <- notesToMarkdown opts (reverse $ stNotes st)
   st' <- get  -- note that the notes may contain refs
   refs' <- refsToMarkdown opts (reverse $ stRefs st')
-  let colwidth = if writerWrapText opts
-                    then Just $ writerColumns opts
-                    else Nothing
-  let main = render colwidth $ body <>
+  let render' :: Doc -> String
+      render' = render colwidth
+  let main = render' $ body <>
                (if isEmpty notes' then empty else blankline <> notes') <>
                (if isEmpty refs' then empty else blankline <> refs')
-  let context  = writerVariables opts ++
-                 [ ("toc", render colwidth toc)
-                 , ("body", main)
-                 ] ++
-                 [ ("titleblock", render colwidth titleblock)
-                   | not (null title && null authors && null date) ]
+  let context  = defField "toc" (render' toc)
+               $ defField "body" main
+               $ (if isNullMeta meta
+                     then id
+                     else defField "titleblock" (render' titleblock))
+               $ metadata
   if writerStandalone opts
-     then return $ renderTemplate context $ writerTemplate opts
+     then return $ renderTemplate' (writerTemplate opts) context
      else return main
 
 -- | Return markdown representation of reference key table.
@@ -187,26 +241,35 @@ noteToMarkdown opts num blocks = do
               else marker <> spacer <> contents
 
 -- | Escape special characters for Markdown.
-escapeString :: String -> String
-escapeString = escapeStringUsing markdownEscapes
-  where markdownEscapes = backslashEscapes "\\`*_$<>#~^"
+escapeString :: WriterOptions -> String -> String
+escapeString opts = escapeStringUsing markdownEscapes
+  where markdownEscapes = backslashEscapes specialChars
+        specialChars =
+                (if isEnabled Ext_superscript opts
+                    then ('^':)
+                    else id) .
+                (if isEnabled Ext_subscript opts
+                    then ('~':)
+                    else id) .
+                (if isEnabled Ext_tex_math_dollars opts
+                    then ('$':)
+                    else id) $
+                "\\`*_<>#"
 
 -- | Construct table of contents from list of header blocks.
 tableOfContents :: WriterOptions -> [Block] -> Doc
 tableOfContents opts headers =
   let opts' = opts { writerIgnoreNotes = True }
-      contents = BulletList $ map elementToListItem $ hierarchicalize headers
-  in  evalState (blockToMarkdown opts' contents) WriterState{ stNotes = []
-                                                            , stRefs  = []
-                                                            , stPlain = False }
+      contents = BulletList $ map (elementToListItem opts) $ hierarchicalize headers
+  in  evalState (blockToMarkdown opts' contents) def
 
 -- | Converts an Element to a list item for a table of contents,
-elementToListItem :: Element -> [Block]
-elementToListItem (Blk _) = []
-elementToListItem (Sec _ _ _ headerText subsecs) = [Plain headerText] ++
-  if null subsecs
-     then []
-     else [BulletList $ map elementToListItem subsecs]
+elementToListItem :: WriterOptions -> Element -> [Block]
+elementToListItem opts (Sec lev _ _ headerText subsecs)
+  = Plain headerText :
+    [ BulletList (map (elementToListItem opts) subsecs) |
+      not (null subsecs) && lev < writerTOCDepth opts ]
+elementToListItem _ (Blk _) = []
 
 attrsToMarkdown :: Attr -> Doc
 attrsToMarkdown attribs = braces $ hsep [attribId, attribClasses, attribKeys]
@@ -245,82 +308,118 @@ blockToMarkdown :: WriterOptions -- ^ Options
                 -> Block         -- ^ Block element
                 -> State WriterState Doc
 blockToMarkdown _ Null = return empty
+blockToMarkdown opts (Div attrs ils) = do
+  contents <- blockListToMarkdown opts ils
+  return $ if isEnabled Ext_raw_html opts &&
+                isEnabled Ext_markdown_in_html_blocks opts
+              then tagWithAttrs "div" attrs <> blankline <>
+                      contents <> blankline <> "</div>" <> blankline
+              else contents <> blankline
 blockToMarkdown opts (Plain inlines) = do
-  contents <- inlineListToMarkdown opts inlines
-  return $ contents <> cr
-blockToMarkdown opts (Para inlines) = do
   contents <- inlineListToMarkdown opts inlines
   -- escape if para starts with ordered list marker
   st <- get
-  let esc = if isEnabled Ext_all_symbols_escapable opts &&
-               not (stPlain st) &&
-               beginsWithOrderedListMarker (render Nothing contents)
-               then text "\x200B" -- zero-width space, a hack
-               else empty
-  return $ esc <> contents <> blankline
+  let colwidth = if writerWrapText opts
+                    then Just $ writerColumns opts
+                    else Nothing
+  let rendered = render colwidth contents
+  let escapeDelimiter (x:xs) | x `elem` (".()" :: String) = '\\':x:xs
+                             | otherwise                  = x : escapeDelimiter xs
+      escapeDelimiter []                                  = []
+  let contents' = if isEnabled Ext_all_symbols_escapable opts &&
+                     not (stPlain st) && beginsWithOrderedListMarker rendered
+                     then text $ escapeDelimiter rendered
+                     else contents
+  return $ contents' <> cr
+-- title beginning with fig: indicates figure
+blockToMarkdown opts (Para [Image alt (src,'f':'i':'g':':':tit)]) =
+  blockToMarkdown opts (Para [Image alt (src,tit)])
+blockToMarkdown opts (Para inlines) =
+  (<> blankline) `fmap` blockToMarkdown opts (Plain inlines)
 blockToMarkdown opts (RawBlock f str)
   | f == "html" = do
-    st <- get
-    if stPlain st
-       then return empty
-       else return $ if isEnabled Ext_markdown_attribute opts
+    plain <- gets stPlain
+    return $ if plain
+                then empty
+                else if isEnabled Ext_markdown_attribute opts
                         then text (addMarkdownAttribute str) <> text "\n"
                         else text str <> text "\n"
-  | f == "latex" || f == "tex" || f == "markdown" = do
-    st <- get
-    if stPlain st
-       then return empty
-       else return $ text str <> text "\n"
+  | f `elem` ["latex", "tex", "markdown"] = do
+    plain <- gets stPlain
+    return $ if plain
+                then empty
+                else text str <> text "\n"
 blockToMarkdown _ (RawBlock _ _) = return empty
-blockToMarkdown _ HorizontalRule =
-  return $ blankline <> text "* * * * *" <> blankline
-blockToMarkdown opts (Header level inlines) = do
-  contents <- inlineListToMarkdown opts inlines
-  st <- get
+blockToMarkdown opts HorizontalRule = do
+  return $ blankline <> text (replicate (writerColumns opts) '-') <> blankline
+blockToMarkdown opts (Header level attr inlines) = do
+  plain <- gets stPlain
+  -- we calculate the id that would be used by auto_identifiers
+  -- so we know whether to print an explicit identifier
+  ids <- gets stIds
+  let autoId = uniqueIdent inlines ids
+  modify $ \st -> st{ stIds = autoId : ids }
+  let attr' = case attr of
+                   ("",[],[]) -> empty
+                   (id',[],[]) | isEnabled Ext_auto_identifiers opts
+                                 && id' == autoId -> empty
+                   (id',_,_)   | isEnabled Ext_mmd_header_identifiers opts ->
+                                    space <> brackets (text id')
+                   _ | isEnabled Ext_header_attributes opts ->
+                                    space <> attrsToMarkdown attr
+                     | otherwise -> empty
+  contents <- inlineListToMarkdown opts $
+                 if level == 1 && plain
+                    then capitalize inlines
+                    else inlines
   let setext = writerSetextHeaders opts
   return $ nowrap
          $ case level of
-            1 | setext ->
-                  contents <> cr <> text (replicate (offset contents) '=') <>
+            1 | plain -> blanklines 3 <> contents <> blanklines 2
+              | setext ->
+                  contents <> attr' <> cr <> text (replicate (offset contents) '=') <>
                   blankline
-            2 | setext ->
-                  contents <> cr <> text (replicate (offset contents) '-') <>
+            2 | plain -> blanklines 2 <> contents <> blankline
+              | setext ->
+                  contents <> attr' <> cr <> text (replicate (offset contents) '-') <>
                   blankline
             -- ghc interprets '#' characters in column 1 as linenum specifiers.
-            _ | stPlain st || isEnabled Ext_literate_haskell opts ->
+            _ | plain || isEnabled Ext_literate_haskell opts ->
                 contents <> blankline
-            _ -> text (replicate level '#') <> space <> contents <> blankline
+            _ -> text (replicate level '#') <> space <> contents <> attr' <> blankline
 blockToMarkdown opts (CodeBlock (_,classes,_) str)
   | "haskell" `elem` classes && "literate" `elem` classes &&
     isEnabled Ext_literate_haskell opts =
   return $ prefixed "> " (text str) <> blankline
 blockToMarkdown opts (CodeBlock attribs str) = return $
-  case attribs of
-     x | x /= nullAttr && isEnabled Ext_fenced_code_blocks opts ->
-          tildes <> space <> attrs <> cr <> text str <>
-           cr <> tildes <> blankline
-     (_,(cls:_),_) | isEnabled Ext_backtick_code_blocks opts ->
-          backticks <> space <> text cls <> cr <> text str <>
-           cr <> backticks <> blankline
+  case attribs == nullAttr of
+     False | isEnabled Ext_backtick_code_blocks opts ->
+          backticks <> attrs <> cr <> text str <> cr <> backticks <> blankline
+           | isEnabled Ext_fenced_code_blocks opts ->
+          tildes <> attrs <> cr <> text str <> cr <> tildes <> blankline
      _ -> nest (writerTabStop opts) (text str) <> blankline
    where tildes    = text $ case [ln | ln <- lines str, all (=='~') ln] of
                                [] -> "~~~~"
                                xs -> case maximum $ map length xs of
                                           n | n < 3 -> "~~~~"
                                             | otherwise -> replicate (n+1) '~'
-         backticks = text "```"
+         backticks = text $ case [ln | ln <- lines str, all (=='`') ln] of
+                               [] -> "```"
+                               xs -> case maximum $ map length xs of
+                                          n | n < 3 -> "```"
+                                            | otherwise -> replicate (n+1) '`'
          attrs  = if isEnabled Ext_fenced_code_attributes opts
-                     then attrsToMarkdown attribs
-                     else empty
+                     then nowrap $ " " <> attrsToMarkdown attribs
+                     else case attribs of
+                                (_,(cls:_),_) -> " " <> text cls
+                                _             -> empty
 blockToMarkdown opts (BlockQuote blocks) = do
-  st <- get
+  plain <- gets stPlain
   -- if we're writing literate haskell, put a space before the bird tracks
   -- so they won't be interpreted as lhs...
   let leader = if isEnabled Ext_literate_haskell opts
                   then " > "
-                  else if stPlain st
-                          then "  "
-                          else "> "
+                  else if plain then "  " else "> "
   contents <- blockListToMarkdown opts blocks
   return $ (prefixed leader contents) <> blankline
 blockToMarkdown opts t@(Table caption aligns widths headers rows) =  do
@@ -331,21 +430,27 @@ blockToMarkdown opts t@(Table caption aligns widths headers rows) =  do
   rawHeaders <- mapM (blockListToMarkdown opts) headers
   rawRows <- mapM (mapM (blockListToMarkdown opts)) rows
   let isSimple = all (==0) widths
-  (nst,tbl) <- case isSimple of
-                True  | isEnabled Ext_simple_tables opts -> fmap (nest 2,) $
+  let isPlainBlock (Plain _) = True
+      isPlainBlock _         = False
+  let hasBlocks = not (all isPlainBlock $ concat . concat $ headers:rows)
+  (nst,tbl) <- case True of
+                _ | isSimple &&
+                    isEnabled Ext_simple_tables opts -> fmap (nest 2,) $
                          pandocTable opts (all null headers) aligns widths
                              rawHeaders rawRows
-                      | isEnabled Ext_pipe_tables opts -> fmap (id,) $
+                  | isSimple &&
+                    isEnabled Ext_pipe_tables opts -> fmap (id,) $
                          pipeTable (all null headers) aligns rawHeaders rawRows
-                      | otherwise -> fmap (id,) $
-                         return $ text $ writeHtmlString def
-                                $ Pandoc (Meta [] [] []) [t]
-                False | isEnabled Ext_multiline_tables opts -> fmap (nest 2,) $
+                  | not hasBlocks &&
+                    isEnabled Ext_multiline_tables opts -> fmap (nest 2,) $
                          pandocTable opts (all null headers) aligns widths
                              rawHeaders rawRows
-                      | otherwise -> fmap (id,) $
+                  | isEnabled Ext_grid_tables opts -> fmap (id,) $
+                         gridTable opts (all null headers) aligns widths
+                             rawHeaders rawRows
+                  | otherwise -> fmap (id,) $
                          return $ text $ writeHtmlString def
-                                $ Pandoc (Meta [] [] []) [t]
+                                $ Pandoc nullMeta [t]
   return $ nst $ tbl $$ blankline $$ caption'' $$ blankline
 blockToMarkdown opts (BulletList items) = do
   contents <- mapM (bulletListItemToMarkdown opts) items
@@ -370,23 +475,31 @@ addMarkdownAttribute :: String -> String
 addMarkdownAttribute s =
   case span isTagText $ reverse $ parseTags s of
        (xs,(TagOpen t attrs:rest)) ->
-            renderTags $ reverse rest ++ (TagOpen t attrs' : reverse xs)
+            renderTags' $ reverse rest ++ (TagOpen t attrs' : reverse xs)
               where attrs' = ("markdown","1"):[(x,y) | (x,y) <- attrs,
                                  x /= "markdown"]
        _ -> s
 
 pipeTable :: Bool -> [Alignment] -> [Doc] -> [[Doc]] -> State WriterState Doc
 pipeTable headless aligns rawHeaders rawRows = do
+  let sp = text " "
+  let blockFor AlignLeft   x y = lblock (x + 2) (sp <> y) <> lblock 0 empty
+      blockFor AlignCenter x y = cblock (x + 2) (sp <> y) <> lblock 0 empty
+      blockFor AlignRight  x y = rblock (x + 2) (sp <> y) <> lblock 0 empty
+      blockFor _           x y = lblock (x + 2) (sp <> y) <> lblock 0 empty
+  let widths = map (max 3 . maximum . map offset) $ transpose (rawHeaders : rawRows)
   let torow cs = nowrap $ text "|" <>
-                 hcat (intersperse (text "|") $ map chomp cs) <> text "|"
-  let toborder (a, h) = let wid = max (offset h) 3
-                        in  text $ case a of
-                             AlignLeft    -> ':':replicate (wid - 1) '-'
-                             AlignCenter  -> ':':replicate (wid - 2) '-' ++ ":"
-                             AlignRight   -> replicate (wid - 1) '-' ++ ":"
-                             AlignDefault -> replicate wid '-'
+                    hcat (intersperse (text "|") $
+                          zipWith3 blockFor aligns widths (map chomp cs))
+                    <> text "|"
+  let toborder (a, w) = text $ case a of
+                             AlignLeft    -> ':':replicate (w + 1) '-'
+                             AlignCenter  -> ':':replicate w '-' ++ ":"
+                             AlignRight   -> replicate (w + 1) '-' ++ ":"
+                             AlignDefault -> replicate (w + 2) '-'
   let header = if headless then empty else torow rawHeaders
-  let border = torow $ map toborder $ zip aligns rawHeaders
+  let border = nowrap $ text "|" <> hcat (intersperse (text "|") $
+                        map toborder $ zip aligns widths) <> text "|"
   let body   = vcat $ map torow rawRows
   return $ header $$ border $$ body
 
@@ -430,13 +543,47 @@ pandocTable opts headless aligns widths rawHeaders rawRows =  do
                   else border
   return $ head'' $$ underline $$ body $$ bottom
 
+gridTable :: WriterOptions -> Bool -> [Alignment] -> [Double]
+          -> [Doc] -> [[Doc]] -> State WriterState Doc
+gridTable opts headless _aligns widths headers' rawRows =  do
+  let numcols = length headers'
+  let widths' = if all (==0) widths
+                   then replicate numcols (1.0 / fromIntegral numcols)
+                   else widths
+  let widthsInChars = map (floor . (fromIntegral (writerColumns opts) *)) widths'
+  let hpipeBlocks blocks = hcat [beg, middle, end]
+        where h       = maximum (map height blocks)
+              sep'    = lblock 3 $ vcat (map text $ replicate h " | ")
+              beg     = lblock 2 $ vcat (map text $ replicate h "| ")
+              end     = lblock 2 $ vcat (map text $ replicate h " |")
+              middle  = chomp $ hcat $ intersperse sep' blocks
+  let makeRow = hpipeBlocks . zipWith lblock widthsInChars
+  let head' = makeRow headers'
+  let rows' = map (makeRow . map chomp) rawRows
+  let border ch = char '+' <> char ch <>
+                  (hcat $ intersperse (char ch <> char '+' <> char ch) $
+                          map (\l -> text $ replicate l ch) widthsInChars) <>
+                  char ch <> char '+'
+  let body = vcat $ intersperse (border '-') rows'
+  let head'' = if headless
+                  then empty
+                  else head' $$ border '='
+  return $ border '-' $$ head'' $$ body $$ border '-'
+
 -- | Convert bullet list item (list of blocks) to markdown.
 bulletListItemToMarkdown :: WriterOptions -> [Block] -> State WriterState Doc
 bulletListItemToMarkdown opts items = do
   contents <- blockListToMarkdown opts items
   let sps = replicate (writerTabStop opts - 2) ' '
   let start = text ('-' : ' ' : sps)
-  return $ hang (writerTabStop opts) start $ contents <> cr
+  -- remove trailing blank line if it is a tight list
+  let contents' = case reverse items of
+                       (BulletList xs:_) | isTightList xs ->
+                            chomp contents <> cr
+                       (OrderedList _ xs:_) | isTightList xs ->
+                            chomp contents <> cr
+                       _ -> contents
+  return $ hang (writerTabStop opts) start $ contents' <> cr
 
 -- | Convert ordered list item (a list of blocks) to markdown.
 orderedListItemToMarkdown :: WriterOptions -- ^ options
@@ -466,8 +613,19 @@ definitionListItemToMarkdown opts (label, defs) = do
        let sps = case writerTabStop opts - 3 of
                       n | n > 0   -> text $ replicate n ' '
                       _           -> text " "
-       let contents = vcat $ map (\d -> hang tabStop (leader <> sps) $ vcat d <> cr) defs'
-       return $ nowrap labelText <> cr <> contents <> cr
+       if isEnabled Ext_compact_definition_lists opts
+          then do
+            let contents = vcat $ map (\d -> hang tabStop (leader <> sps)
+                                $ vcat d <> cr) defs'
+            return $ nowrap labelText <> cr <> contents <> cr
+          else do
+            let contents = vcat $ map (\d -> hang tabStop (leader <> sps)
+                                $ vcat d <> cr) defs'
+            let isTight = case defs of
+                               ((Plain _ : _): _) -> True
+                               _ -> False
+            return $ blankline <> nowrap labelText <>
+                     (if isTight then cr else blankline) <> contents <> blankline
      else do
        return $ nowrap labelText <> text "  " <> cr <>
                 vsep (map vsep defs') <> blankline
@@ -482,15 +640,21 @@ blockListToMarkdown opts blocks =
     -- code block will be treated as a list continuation paragraph
     where fixBlocks (b : CodeBlock attr x : rest)
             | (not (isEnabled Ext_fenced_code_blocks opts) || attr == nullAttr)
-                && isListBlock b =
-               b : RawBlock "html" "<!-- -->\n" : CodeBlock attr x :
-                   fixBlocks rest
+                && isListBlock b = b : commentSep : CodeBlock attr x :
+                                   fixBlocks rest
+          fixBlocks (b1@(BulletList _) : b2@(BulletList _) : bs) =
+               b1 : commentSep : fixBlocks (b2:bs)
+          fixBlocks (b1@(OrderedList _ _) : b2@(OrderedList _ _) : bs) =
+               b1 : commentSep : fixBlocks (b2:bs)
+          fixBlocks (b1@(DefinitionList _) : b2@(DefinitionList _) : bs) =
+               b1 : commentSep : fixBlocks (b2:bs)
           fixBlocks (x : xs)             = x : fixBlocks xs
           fixBlocks []                   = []
           isListBlock (BulletList _)     = True
           isListBlock (OrderedList _ _)  = True
           isListBlock (DefinitionList _) = True
           isListBlock _                  = False
+          commentSep                     = RawBlock "html" "<!-- -->\n"
 
 -- | Get reference for target; if none exists, create unique one and return.
 --   Prefer label if possible; otherwise, generate a unique key.
@@ -502,10 +666,11 @@ getReference label (src, tit) = do
     Nothing       -> do
       let label' = case find ((== label) . fst) (stRefs st) of
                       Just _ -> -- label is used; generate numerical label
-                                 case find (\n -> not (any (== [Str (show n)])
-                                           (map fst (stRefs st)))) [1..(10000 :: Integer)] of
-                                      Just x  -> [Str (show x)]
-                                      Nothing -> error "no unique label"
+                             case find (\n -> notElem [Str (show n)]
+                                                      (map fst (stRefs st)))
+                                       [1..(10000 :: Integer)] of
+                                  Just x  -> [Str (show x)]
+                                  Nothing -> error "no unique label"
                       Nothing -> label
       modify (\s -> s{ stRefs = (label', (src,tit)) : stRefs st })
       return label'
@@ -513,7 +678,11 @@ getReference label (src, tit) = do
 -- | Convert list of Pandoc inline elements to markdown.
 inlineListToMarkdown :: WriterOptions -> [Inline] -> State WriterState Doc
 inlineListToMarkdown opts lst =
-  mapM (inlineToMarkdown opts) lst >>= return . cat
+  mapM (inlineToMarkdown opts) (avoidBadWraps lst) >>= return . cat
+  where avoidBadWraps [] = []
+        avoidBadWraps (Space:Str (c:cs):xs)
+          | c `elem` ("-*+>" :: String) = Str (' ':c:cs) : avoidBadWraps xs
+        avoidBadWraps (x:xs) = x : avoidBadWraps xs
 
 escapeSpaces :: Inline -> Inline
 escapeSpaces (Str s) = Str $ substitute " " "\\ " s
@@ -522,52 +691,73 @@ escapeSpaces x = x
 
 -- | Convert Pandoc inline element to markdown.
 inlineToMarkdown :: WriterOptions -> Inline -> State WriterState Doc
+inlineToMarkdown opts (Span attrs ils) = do
+  contents <- inlineListToMarkdown opts ils
+  return $ if isEnabled Ext_raw_html opts
+              then tagWithAttrs "span" attrs <> contents <> text "</span>"
+              else contents
 inlineToMarkdown opts (Emph lst) = do
+  plain <- gets stPlain
   contents <- inlineListToMarkdown opts lst
-  return $ "*" <> contents <> "*"
+  return $ if plain
+              then "_" <> contents <> "_"
+              else "*" <> contents <> "*"
 inlineToMarkdown opts (Strong lst) = do
-  contents <- inlineListToMarkdown opts lst
-  return $ "**" <> contents <> "**"
+  plain <- gets stPlain
+  if plain
+     then inlineListToMarkdown opts $ capitalize lst
+     else do
+       contents <- inlineListToMarkdown opts lst
+       return $ "**" <> contents <> "**"
 inlineToMarkdown opts (Strikeout lst) = do
   contents <- inlineListToMarkdown opts lst
   return $ if isEnabled Ext_strikeout opts
               then "~~" <> contents <> "~~"
               else "<s>" <> contents <> "</s>"
 inlineToMarkdown opts (Superscript lst) = do
-  let lst' = bottomUp escapeSpaces lst
-  contents <- inlineListToMarkdown opts lst'
+  contents <- inlineListToMarkdown opts $ walk escapeSpaces lst
   return $ if isEnabled Ext_superscript opts
               then "^" <> contents <> "^"
               else "<sup>" <> contents <> "</sup>"
 inlineToMarkdown opts (Subscript lst) = do
-  let lst' = bottomUp escapeSpaces lst
-  contents <- inlineListToMarkdown opts lst'
+  contents <- inlineListToMarkdown opts $ walk escapeSpaces lst
   return $ if isEnabled Ext_subscript opts
               then "~" <> contents <> "~"
               else "<sub>" <> contents <> "</sub>"
-inlineToMarkdown opts (SmallCaps lst) = inlineListToMarkdown opts lst
+inlineToMarkdown opts (SmallCaps lst) = do
+  plain <- gets stPlain
+  if plain
+     then inlineListToMarkdown opts $ capitalize lst
+     else do
+       contents <- inlineListToMarkdown opts lst
+       return $ tagWithAttrs "span"
+            ("",[],[("style","font-variant:small-caps;")])
+             <> contents <> text "</span>"
 inlineToMarkdown opts (Quoted SingleQuote lst) = do
   contents <- inlineListToMarkdown opts lst
   return $ "‘" <> contents <> "’"
 inlineToMarkdown opts (Quoted DoubleQuote lst) = do
   contents <- inlineListToMarkdown opts lst
   return $ "“" <> contents <> "”"
-inlineToMarkdown opts (Code attr str) =
+inlineToMarkdown opts (Code attr str) = do
   let tickGroups = filter (\s -> '`' `elem` s) $ group str
-      longest    = if null tickGroups
+  let longest    = if null tickGroups
                      then 0
                      else maximum $ map length tickGroups
-      marker     = replicate (longest + 1) '`'
-      spacer     = if (longest == 0) then "" else " "
-      attrs      = if isEnabled Ext_inline_code_attributes opts && attr /= nullAttr
+  let marker     = replicate (longest + 1) '`'
+  let spacer     = if (longest == 0) then "" else " "
+  let attrs      = if isEnabled Ext_inline_code_attributes opts && attr /= nullAttr
                       then attrsToMarkdown attr
                       else empty
-  in  return $ text (marker ++ spacer ++ str ++ spacer ++ marker) <> attrs
-inlineToMarkdown _ (Str str) = do
+  plain <- gets stPlain
+  if plain
+     then return $ text str
+     else return $ text (marker ++ spacer ++ str ++ spacer ++ marker) <> attrs
+inlineToMarkdown opts (Str str) = do
   st <- get
   if stPlain st
      then return $ text str
-     else return $ text $ escapeString str
+     else return $ text $ escapeString opts str
 inlineToMarkdown opts (Math InlineMath str)
   | isEnabled Ext_tex_math_dollars opts =
       return $ "$" <> text str <> "$"
@@ -575,7 +765,11 @@ inlineToMarkdown opts (Math InlineMath str)
       return $ "\\(" <> text str <> "\\)"
   | isEnabled Ext_tex_math_double_backslash opts =
       return $ "\\\\(" <> text str <> "\\\\)"
-  | otherwise = inlineListToMarkdown opts $ readTeXMath str
+  | otherwise = do
+    plain <- gets stPlain
+    inlineListToMarkdown opts $
+      (if plain then makeMathPlainer else id) $
+      texMathToInlines InlineMath str
 inlineToMarkdown opts (Math DisplayMath str)
   | isEnabled Ext_tex_math_dollars opts =
       return $ "$$" <> text str <> "$$"
@@ -584,28 +778,38 @@ inlineToMarkdown opts (Math DisplayMath str)
   | isEnabled Ext_tex_math_double_backslash opts =
       return $ "\\\\[" <> text str <> "\\\\]"
   | otherwise = (\x -> cr <> x <> cr) `fmap`
-        inlineListToMarkdown opts (readTeXMath str)
-inlineToMarkdown opts (RawInline f str)
-  | f == "html" || f == "markdown" ||
-    (isEnabled Ext_raw_tex opts && (f == "latex" || f == "tex")) =
-    return $ text str
-inlineToMarkdown _ (RawInline _ _) = return empty
-inlineToMarkdown opts (LineBreak)
-  | isEnabled Ext_hard_line_breaks opts    = return cr
-  | isEnabled Ext_escaped_line_breaks opts = return $ "\\" <> cr
-  | otherwise                              = return $ "  " <> cr
+        inlineListToMarkdown opts (texMathToInlines DisplayMath str)
+inlineToMarkdown opts (RawInline f str) = do
+  plain <- gets stPlain
+  if not plain &&
+     ( f == "markdown" ||
+       (isEnabled Ext_raw_tex opts && (f == "latex" || f == "tex")) ||
+       (isEnabled Ext_raw_html opts && f == "html") )
+    then return $ text str
+    else return empty
+inlineToMarkdown opts (LineBreak) = do
+  plain <- gets stPlain
+  if plain || isEnabled Ext_hard_line_breaks opts
+     then return cr
+     else return $
+          if isEnabled Ext_escaped_line_breaks opts
+             then "\\" <> cr
+             else "  " <> cr
 inlineToMarkdown _ Space = return space
+inlineToMarkdown opts (Cite [] lst) = inlineListToMarkdown opts lst
 inlineToMarkdown opts (Cite (c:cs) lst)
-  | writerCiteMethod opts == Citeproc = inlineListToMarkdown opts lst
-  | citationMode c == AuthorInText = do
-    suffs <- inlineListToMarkdown opts $ citationSuffix c
-    rest <- mapM convertOne cs
-    let inbr = suffs <+> joincits rest
-        br   = if isEmpty inbr then empty else char '[' <> inbr <> char ']'
-    return $ text ("@" ++ citationId c) <+> br
-  | otherwise = do
-    cits <- mapM convertOne (c:cs)
-    return $ text "[" <> joincits cits <> text "]"
+  | not (isEnabled Ext_citations opts) = inlineListToMarkdown opts lst
+  | otherwise =
+      if citationMode c == AuthorInText
+         then do
+           suffs <- inlineListToMarkdown opts $ citationSuffix c
+           rest <- mapM convertOne cs
+           let inbr = suffs <+> joincits rest
+               br   = if isEmpty inbr then empty else char '[' <> inbr <> char ']'
+           return $ text ("@" ++ citationId c) <+> br
+         else do
+           cits <- mapM convertOne (c:cs)
+           return $ text "[" <> joincits cits <> text "]"
   where
         joincits = hcat . intersperse (text "; ") . filter (not . isEmpty)
         convertOne Citation { citationId      = k
@@ -617,41 +821,49 @@ inlineToMarkdown opts (Cite (c:cs) lst)
            sdoc <- inlineListToMarkdown opts sinlines
            let k' = text (modekey m ++ "@" ++ k)
                r = case sinlines of
-                        Str (y:_):_ | y `elem` ",;]@" -> k' <> sdoc
-                        _                             -> k' <+> sdoc
+                        Str (y:_):_ | y `elem` (",;]@" :: String) -> k' <> sdoc
+                        _                                         -> k' <+> sdoc
            return $ pdoc <+> r
         modekey SuppressAuthor = "-"
         modekey _              = ""
-inlineToMarkdown _ (Cite _ _) = return $ text ""
 inlineToMarkdown opts (Link txt (src, tit)) = do
+  plain <- gets stPlain
   linktext <- inlineListToMarkdown opts txt
   let linktitle = if null tit
                      then empty
                      else text $ " \"" ++ tit ++ "\""
-  let srcSuffix = if isPrefixOf "mailto:" src then drop 7 src else src
-  let useAuto = case (tit,txt) of
-                      ("", [Code _ s]) | s == srcSuffix -> True
-                      _                                 -> False
+  let srcSuffix = fromMaybe src (stripPrefix "mailto:" src)
+  let useAuto = isURI src &&
+                case txt of
+                      [Str s] | escapeURI s == srcSuffix -> True
+                      _                                  -> False
   let useRefLinks = writerReferenceLinks opts && not useAuto
   ref <- if useRefLinks then getReference txt (src, tit) else return []
   reftext <- inlineListToMarkdown opts ref
   return $ if useAuto
-              then "<" <> text srcSuffix <> ">"
+              then if plain
+                      then text srcSuffix
+                      else "<" <> text srcSuffix <> ">"
               else if useRefLinks
                       then let first  = "[" <> linktext <> "]"
                                second = if txt == ref
                                            then "[]"
                                            else "[" <> reftext <> "]"
                            in  first <> second
-                      else "[" <> linktext <> "](" <>
-                           text src <> linktitle <> ")"
+                      else if plain
+                              then linktext
+                              else "[" <> linktext <> "](" <>
+                                   text src <> linktitle <> ")"
 inlineToMarkdown opts (Image alternate (source, tit)) = do
+  plain <- gets stPlain
   let txt = if null alternate || alternate == [Str source]
                                  -- to prevent autolinks
                then [Str ""]
                else alternate
   linkPart <- inlineToMarkdown opts (Link txt (source, tit))
-  return $ "!" <> linkPart
+  return $ if plain
+              then "[" <> linkPart <> "]"
+              else "!" <> linkPart
 inlineToMarkdown opts (Note contents) = do
   modify (\st -> st{ stNotes = contents : stNotes st })
   st <- get
@@ -659,3 +871,9 @@ inlineToMarkdown opts (Note contents) = do
   if isEnabled Ext_footnotes opts
      then return $ "[^" <> ref <> "]"
      else return $ "[" <> ref <> "]"
+
+makeMathPlainer :: [Inline] -> [Inline]
+makeMathPlainer = walk go
+  where
+  go (Emph xs) = Span nullAttr xs
+  go x = x

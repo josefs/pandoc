@@ -1,3 +1,5 @@
+{-# LANGUAGE PatternGuards #-}
+
 {-
 Copyright (c) 2011-2012, Sergey Astanin
 All rights reserved.
@@ -28,8 +30,8 @@ module Text.Pandoc.Writers.FB2 (writeFB2)  where
 import Control.Monad.State (StateT, evalStateT, get, modify)
 import Control.Monad.State (liftM, liftM2, liftIO)
 import Data.ByteString.Base64 (encode)
-import Data.Char (toUpper, toLower, isSpace, isAscii, isControl)
-import Data.List (intersperse, intercalate, isPrefixOf)
+import Data.Char (toLower, isSpace, isAscii, isControl)
+import Data.List (intersperse, intercalate, isPrefixOf, stripPrefix)
 import Data.Either (lefts, rights)
 import Network.Browser (browse, request, setAllowRedirects, setOutHandler)
 import Network.HTTP (catchIO_, getRequest, getHeaders, getResponseBody)
@@ -44,8 +46,7 @@ import qualified Text.XML.Light.Cursor as XC
 
 import Text.Pandoc.Definition
 import Text.Pandoc.Options (WriterOptions(..), HTMLMathMethod(..), def)
-import Text.Pandoc.Shared (orderedListMarkers)
-import Text.Pandoc.Generic (bottomUp)
+import Text.Pandoc.Shared (orderedListMarkers, isHeaderBlock, capitalize)
 
 -- | Data to be written at the end of the document:
 -- (foot)notes, URLs, references, images.
@@ -84,7 +85,7 @@ writeFB2 opts (Pandoc meta blocks) = flip evalStateT newFB $ do
      (imgs,missing) <- liftM imagesToFetch get >>= \s -> liftIO (fetchImages s)
      let body' = replaceImagesWithAlt missing body
      let fb2_xml = el "FictionBook" (fb2_attrs, [desc, body'] ++ notes ++ imgs)
-     return $ xml_head ++ (showContent fb2_xml)
+     return $ xml_head ++ (showContent fb2_xml) ++ "\n"
   where
   xml_head = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
   fb2_attrs =
@@ -157,9 +158,7 @@ renderSection level (ttl, body) = do
                else cMapM blockToXml body
     return $ el "section" (title ++ content)
   where
-    hasSubsections = any isHeader
-    isHeader (Header _ _) = True
-    isHeader _ = False
+    hasSubsections = any isHeaderBlock
 
 -- | Only <p> and <empty-line> are allowed within <title> in FB2.
 formatTitle :: [Inline] -> [Content]
@@ -186,13 +185,13 @@ splitSections level blocks = reverse $ revSplit (reverse blocks)
     let (lastsec, before) = break sameLevel rblocks
         (header, prevblocks) =
             case before of
-              ((Header n title):prevblocks') ->
+              ((Header n _ title):prevblocks') ->
                   if n == level
                      then (title, prevblocks')
                      else ([], before)
               _ -> ([], before)
     in (header, reverse lastsec) : revSplit prevblocks
-  sameLevel (Header n _) = n == level
+  sameLevel (Header n _ _) = n == level
   sameLevel _ = False
 
 -- | Make another FictionBook body with footnotes.
@@ -255,22 +254,21 @@ readDataURI :: String -- ^ URI
             -> Maybe (String,String,Bool,String)
                -- ^ Maybe (mime,charset,isBase64,data)
 readDataURI uri =
-    let prefix = "data:"
-    in  if not (prefix `isPrefixOf` uri)
-        then Nothing
-        else
-            let rest = drop (length prefix) uri
-                meta = takeWhile (/= ',') rest  -- without trailing ','
-                uridata = drop (length meta + 1) rest
-                parts = split (== ';') meta
-                (mime,cs,enc)=foldr upd ("text/plain","US-ASCII",False) parts
-            in  Just (mime,cs,enc,uridata)
+  case stripPrefix "data:" uri of
+    Nothing   -> Nothing
+    Just rest ->
+      let meta = takeWhile (/= ',') rest  -- without trailing ','
+          uridata = drop (length meta + 1) rest
+          parts = split (== ';') meta
+          (mime,cs,enc)=foldr upd ("text/plain","US-ASCII",False) parts
+      in  Just (mime,cs,enc,uridata)
+
  where
    upd str m@(mime,cs,enc)
-       | isMimeType str               = (str,cs,enc)
-       | "charset=" `isPrefixOf` str  = (mime,drop (length "charset=") str,enc)
-       | str ==  "base64"             = (mime,cs,True)
-       | otherwise                    = m
+       | isMimeType str                          = (str,cs,enc)
+       | Just str' <- stripPrefix "charset=" str = (mime,str',enc)
+       | str ==  "base64"                        = (mime,cs,True)
+       | otherwise                               = m
 
 -- Without parameters like ;charset=...; see RFC 2045, 5.1
 isMimeType :: String -> Bool
@@ -298,7 +296,6 @@ fetchURL url = do
      let content_type = lookupHeader HdrContentType (getHeaders r)
      content <- liftM (Just . toStr . encode . toBS) . getResponseBody $ Right r
      return $ liftM2 (,) content_type content
-  where
 
 toBS :: String -> B.ByteString
 toBS = B.pack . map (toEnum . fromEnum)
@@ -316,12 +313,15 @@ linkID i = "l" ++ (show i)
 blockToXml :: Block -> FBM [Content]
 blockToXml (Plain ss) = cMapM toXml ss  -- FIXME: can lead to malformed FB2
 blockToXml (Para [Math DisplayMath formula]) = insertMath NormalImage formula
-blockToXml (Para [img@(Image _ _)]) = insertImage NormalImage img
+-- title beginning with fig: indicates that the image is a figure
+blockToXml (Para [Image alt (src,'f':'i':'g':':':tit)]) =
+  insertImage NormalImage (Image alt (src,tit))
 blockToXml (Para ss) = liftM (list . el "p") $ cMapM toXml ss
 blockToXml (CodeBlock _ s) = return . spaceBeforeAfter .
                              map (el "p" . el "code") . lines $ s
 blockToXml (RawBlock _ s) = return . spaceBeforeAfter .
                             map (el "p" . el "code") . lines $ s
+blockToXml (Div _ bs) = cMapM blockToXml bs
 blockToXml (BlockQuote bs) = liftM (list . el "cite") $ cMapM blockToXml bs
 blockToXml (OrderedList a bss) = do
     state <- get
@@ -361,7 +361,7 @@ blockToXml (DefinitionList defs) =
       needsBreak (Para _) = False
       needsBreak (Plain ins) = LineBreak `notElem` ins
       needsBreak _ = True
-blockToXml (Header _ _) = -- should never happen, see renderSections
+blockToXml (Header _ _ _) = -- should never happen, see renderSections
                           error "unexpected header in section text"
 blockToXml HorizontalRule = return
                             [ el "empty-line" ()
@@ -413,7 +413,7 @@ indent = indentBlock
     let s' = unlines . map (spacer++) . lines $ s
     in  CodeBlock a s'
   indentBlock (BlockQuote bs) = BlockQuote (map indent bs)
-  indentBlock (Header l ins) = Header l (indentLines ins)
+  indentBlock (Header l attr' ins) = Header l attr' (indentLines ins)
   indentBlock everythingElse = everythingElse
   -- indent every (explicit) line
   indentLines :: [Inline] -> [Inline]
@@ -423,12 +423,13 @@ indent = indentBlock
 -- | Convert a Pandoc's Inline element to FictionBook XML representation.
 toXml :: Inline -> FBM [Content]
 toXml (Str s) = return [txt s]
+toXml (Span _ ils) = cMapM toXml ils
 toXml (Emph ss) = list `liftM` wrap "emphasis" ss
 toXml (Strong ss) = list `liftM` wrap "strong" ss
 toXml (Strikeout ss) = list `liftM` wrap "strikethrough" ss
 toXml (Superscript ss) = list `liftM` wrap "sup" ss
 toXml (Subscript ss) = list `liftM` wrap "sub" ss
-toXml (SmallCaps ss) = cMapM toXml $ bottomUp (map toUpper) ss
+toXml (SmallCaps ss) = cMapM toXml $ capitalize ss
 toXml (Quoted SingleQuote ss) = do  -- FIXME: should be language-specific
   inner <- cMapM toXml ss
   return $ [txt "‘"] ++ inner ++ [txt "’"]
@@ -558,6 +559,7 @@ list = (:[])
 plain :: Inline -> String
 plain (Str s) = s
 plain (Emph ss) = concat (map plain ss)
+plain (Span _ ss) = concat (map plain ss)
 plain (Strong ss) = concat (map plain ss)
 plain (Strikeout ss) = concat (map plain ss)
 plain (Superscript ss) = concat (map plain ss)

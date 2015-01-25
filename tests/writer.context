@@ -30,6 +30,9 @@
 \setupitemize[autointro]    % prevent orphan list intro
 \setupitemize[indentnext=no]
 
+\setupfloat[figure][default={here,nonumber}]
+\setupfloat[table][default={here,nonumber}]
+
 \setupthinrules[width=15em] % width of horizontal rules
 
 \setupdelimitedtext
@@ -115,7 +118,7 @@ sub status {
 
 A list:
 
-\startitemize[n][stopper=.]
+\startitemize[n,packed][stopper=.]
 \item
   item one
 \item
@@ -169,7 +172,7 @@ These should not be escaped:  \$ \\ \> \[ \{
 
 Asterisks tight:
 
-\startitemize
+\startitemize[packed]
 \item
   asterisk 1
 \item
@@ -191,7 +194,7 @@ Asterisks loose:
 
 Pluses tight:
 
-\startitemize
+\startitemize[packed]
 \item
   Plus 1
 \item
@@ -213,7 +216,7 @@ Pluses loose:
 
 Minuses tight:
 
-\startitemize
+\startitemize[packed]
 \item
   Minus 1
 \item
@@ -237,7 +240,7 @@ Minuses loose:
 
 Tight:
 
-\startitemize[n][stopper=.]
+\startitemize[n,packed][stopper=.]
 \item
   First
 \item
@@ -248,7 +251,7 @@ Tight:
 
 and:
 
-\startitemize[n][stopper=.]
+\startitemize[n,packed][stopper=.]
 \item
   One
 \item
@@ -294,13 +297,13 @@ Multiple paragraphs:
 
 \subsection[nested]{Nested}
 
-\startitemize
+\startitemize[packed]
 \item
   Tab
-  \startitemize
+  \startitemize[packed]
   \item
     Tab
-    \startitemize
+    \startitemize[packed]
     \item
       Tab
     \stopitemize
@@ -309,12 +312,12 @@ Multiple paragraphs:
 
 Here's another:
 
-\startitemize[n][stopper=.]
+\startitemize[n,packed][stopper=.]
 \item
   First
 \item
   Second:
-  \startitemize
+  \startitemize[packed]
   \item
     Fee
   \item
@@ -334,7 +337,7 @@ Same thing but with paragraphs:
 \item
   Second:
 
-  \startitemize
+  \startitemize[packed]
   \item
     Fee
   \item
@@ -372,12 +375,12 @@ Same thing but with paragraphs:
 
   with a continuation
 
-  \startitemize[r][start=4,stopper=.,width=2.0em]
+  \startitemize[r,packed][start=4,stopper=.,width=2.0em]
   \item
     sublist with roman numerals, starting with 4
   \item
     more items
-    \startitemize[A][left=(,stopper=),width=2.0em]
+    \startitemize[A,packed][left=(,stopper=),width=2.0em]
     \item
       a subsublist
     \item
@@ -388,16 +391,16 @@ Same thing but with paragraphs:
 
 Nesting:
 
-\startitemize[A][stopper=.]
+\startitemize[A,packed][stopper=.]
 \item
   Upper Alpha
-  \startitemize[R][stopper=.]
+  \startitemize[R,packed][stopper=.]
   \item
     Upper Roman.
-    \startitemize[n][start=6,left=(,stopper=),width=2.0em]
+    \startitemize[n,packed][start=6,left=(,stopper=),width=2.0em]
     \item
       Decimal start with 6
-      \startitemize[a][start=3,stopper=)]
+      \startitemize[a,packed][start=3,stopper=)]
       \item
         Lower alpha with paren
       \stopitemize
@@ -407,12 +410,12 @@ Nesting:
 
 Autonumbering:
 
-\startitemize[n]
+\startitemize[n,packed]
 \item
   Autonumber.
 \item
   More.
-  \startitemize[a]
+  \startitemize[a,packed]
   \item
     Nested.
   \stopitemize
@@ -529,7 +532,7 @@ Blank line after term, indented marker, alternate markers:
 \startdescription{orange}
   orange fruit
 
-  \startitemize[n][stopper=.]
+  \startitemize[n,packed][stopper=.]
   \item
     sublist
   \item
@@ -545,6 +548,7 @@ foo
 And nested without indentation:
 
 foo
+
 bar
 Interpreted markdown in a table:
 
@@ -553,6 +557,7 @@ And this is {\bf strong}
 Here's a simple block:
 
 foo
+
 This should be a code block, though:
 
 \starttyping
@@ -646,7 +651,7 @@ Ellipses\ldots{}and\ldots{}and\ldots{}.
 
 \section[latex]{LaTeX}
 
-\startitemize
+\startitemize[packed]
 \item
   \cite[22-23]{smith.1899}
 \item
@@ -668,7 +673,7 @@ Ellipses\ldots{}and\ldots{}and\ldots{}.
 
 These shouldn't be math:
 
-\startitemize
+\startitemize[packed]
 \item
   To get the famous equation, write \type{$e = mc^2$}.
 \item
@@ -688,7 +693,7 @@ Here's a LaTeX table:
 
 Here is some unicode:
 
-\startitemize
+\startitemize[packed]
 \item
   I hat: Î
 \item
@@ -810,24 +815,22 @@ braces]\from[url26].
 
 \subsection[autolinks]{Autolinks}
 
-With an ampersand:
-\useURL[url27][http://example.com/?foo=1&bar=2][][\hyphenatedurl{http://example.com/?foo=1&bar=2}]\from[url27]
+With an ampersand: \useURL[url27][http://example.com/?foo=1&bar=2]\from[url27]
 
-\startitemize
+\startitemize[packed]
 \item
   In a list?
 \item
-  \useURL[url28][http://example.com/][][\hyphenatedurl{http://example.com/}]\from[url28]
+  \useURL[url28][http://example.com/]\from[url28]
 \item
   It should.
 \stopitemize
 
 An e-mail address:
-\useURL[url29][mailto:nobody@nowhere.net][][\hyphenatedurl{nobody@nowhere.net}]\from[url29]
+\useURL[url29][mailto:nobody@nowhere.net][][nobody@nowhere.net]\from[url29]
 
 \startblockquote
-Blockquoted:
-\useURL[url30][http://example.com/][][\hyphenatedurl{http://example.com/}]\from[url30]
+Blockquoted: \useURL[url30][http://example.com/]\from[url30]
 \stopblockquote
 
 Auto-links should not occur here: \type{<http://example.com/>}
@@ -842,7 +845,7 @@ or here: <http://example.com/>
 
 From \quotation{Voyage dans la Lune} by Georges Melies (1902):
 
-\placefigure[here,nonumber]{lalune}{\externalfigure[lalune.jpg]}
+\placefigure{lalune}{\externalfigure[lalune.jpg]}
 
 Here is a movie {\externalfigure[movie.jpg]} icon.
 
@@ -873,7 +876,7 @@ note{]} Here is an inline note.\footnote{This is {\em easier} to type. Inline
 Notes can go in quotes.\footnote{In quote.}
 \stopblockquote
 
-\startitemize[n][stopper=.]
+\startitemize[n,packed][stopper=.]
 \item
   And in list items.\footnote{In list.}
 \stopitemize

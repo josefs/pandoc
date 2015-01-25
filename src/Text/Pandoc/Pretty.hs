@@ -1,6 +1,6 @@
-{-# LANGUAGE GeneralizedNewtypeDeriving #-}
+{-# LANGUAGE GeneralizedNewtypeDeriving, CPP #-}
 {-
-Copyright (C) 2010 John MacFarlane <jgm@berkeley.edu>
+Copyright (C) 2010-2014 John MacFarlane <jgm@berkeley.edu>
 
 This program is free software; you can redistribute it and/or modify
 it under the terms of the GNU General Public License as published by
@@ -19,7 +19,7 @@ Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111(-1)307  USA
 
 {- |
    Module      : Text.Pandoc.Pretty
-   Copyright   : Copyright (C) 2010 John MacFarlane
+   Copyright   : Copyright (C) 2010-2014 John MacFarlane
    License     : GNU GPL, version 2 or above
 
    Maintainer  : John MacFarlane <jgm@berkeley.edu>
@@ -35,6 +35,7 @@ module Text.Pandoc.Pretty (
      , render
      , cr
      , blankline
+     , blanklines
      , space
      , text
      , char
@@ -60,6 +61,7 @@ module Text.Pandoc.Pretty (
      , hsep
      , vcat
      , vsep
+     , nestle
      , chomp
      , inside
      , braces
@@ -72,7 +74,7 @@ module Text.Pandoc.Pretty (
      )
 
 where
-import Data.Sequence (Seq, fromList, (<|), singleton, mapWithIndex)
+import Data.Sequence (Seq, fromList, (<|), singleton, mapWithIndex, viewl, ViewL(..))
 import Data.Foldable (toList)
 import Data.List (intercalate)
 import Data.Monoid
@@ -80,8 +82,7 @@ import Data.String
 import Control.Monad.State
 import Data.Char (isSpace)
 
-data Monoid a =>
-     RenderState a = RenderState{
+data RenderState a = RenderState{
          output       :: [a]        -- ^ In reverse order
        , prefix       :: String
        , usePrefix    :: Bool
@@ -100,14 +101,11 @@ data D = Text Int String
        | BreakingSpace
        | CarriageReturn
        | NewLine
-       | BlankLine
+       | BlankLines Int  -- number of blank lines
        deriving (Show)
 
 newtype Doc = Doc { unDoc :: Seq D }
-              deriving (Monoid)
-
-instance Show Doc where
-  show = render Nothing
+              deriving (Monoid, Show)
 
 instance IsString Doc where
   fromString = text
@@ -116,7 +114,7 @@ isBlank :: D -> Bool
 isBlank BreakingSpace  = True
 isBlank CarriageReturn = True
 isBlank NewLine        = True
-isBlank BlankLine      = True
+isBlank (BlankLines _) = True
 isBlank (Text _ (c:_)) = isSpace c
 isBlank _              = False
 
@@ -189,16 +187,26 @@ vcat = foldr ($$) empty
 vsep :: [Doc] -> Doc
 vsep = foldr ($+$) empty
 
+-- | Removes leading blank lines from a 'Doc'.
+nestle :: Doc -> Doc
+nestle (Doc d) = Doc $ go d
+  where go x = case viewl x of
+               (BlankLines _ :< rest) -> go rest
+               (NewLine :< rest)   -> go rest
+               _                   -> x
+
 -- | Chomps trailing blank space off of a 'Doc'.
 chomp :: Doc -> Doc
 chomp d = Doc (fromList dl')
   where dl = toList (unDoc d)
-        dl' = reverse $ dropWhile removeable $ reverse dl
-        removeable BreakingSpace = True
-        removeable CarriageReturn = True
-        removeable NewLine = True
-        removeable BlankLine = True
-        removeable _ = False
+        dl' = reverse $ go $ reverse dl
+        go [] = []
+        go (BreakingSpace : xs) = go xs
+        go (CarriageReturn : xs) = go xs
+        go (NewLine : xs) = go xs
+        go (BlankLines _ : xs) = go xs
+        go (Prefixed s d' : xs) = Prefixed s (chomp d') : xs
+        go xs = xs
 
 outp :: (IsString a, Monoid a)
      => Int -> String -> DocState a
@@ -209,9 +217,10 @@ outp off s | off < 0 = do  -- offset < 0 means newline characters
     let pref = reverse $ dropWhile isSpace $ reverse rawpref
     modify $ \st -> st{ output = fromString pref : output st
                       , column = column st + realLength pref }
+  let numnewlines = length $ takeWhile (=='\n') $ reverse s
   modify $ \st -> st { output = fromString s : output st
                      , column = 0
-                     , newlines = newlines st + 1 }
+                     , newlines = newlines st + numnewlines }
 outp off s = do           -- offset >= 0 (0 might be combining char)
   st' <- get
   let pref = prefix st'
@@ -270,16 +279,15 @@ renderList (BeforeNonBlank d : xs) =
           | otherwise -> renderDoc d >> renderList xs
     []                -> renderList xs
 
-renderList (BlankLine : xs) = do
+renderList (BlankLines num : xs) = do
   st <- get
   case output st of
-     _ | newlines st > 1 || null xs -> return ()
-     _ | column st == 0 -> do
-       outp (-1) "\n"
-     _         -> do
-       outp (-1) "\n"
-       outp (-1) "\n"
+     _ | newlines st > num || null xs -> return ()
+       | otherwise -> replicateM_ (1 + num - newlines st) (outp (-1) "\n")
   renderList xs
+
+renderList (CarriageReturn : BlankLines m : xs) =
+  renderList (BlankLines m : xs)
 
 renderList (CarriageReturn : xs) = do
   st <- get
@@ -295,7 +303,7 @@ renderList (NewLine : xs) = do
 
 renderList (BreakingSpace : CarriageReturn : xs) = renderList (CarriageReturn:xs)
 renderList (BreakingSpace : NewLine : xs) = renderList (NewLine:xs)
-renderList (BreakingSpace : BlankLine : xs) = renderList (BlankLine:xs)
+renderList (BreakingSpace : BlankLines n : xs) = renderList (BlankLines n:xs)
 renderList (BreakingSpace : BreakingSpace : xs) = renderList (BreakingSpace:xs)
 renderList (BreakingSpace : xs) = do
   let isText (Text _ _)       = True
@@ -376,9 +384,13 @@ cr = Doc $ singleton CarriageReturn
 
 -- | Inserts a blank line unless one exists already.
 -- (@blankline <> blankline@ has the same effect as @blankline@.
--- If you want multiple blank lines, use @text "\\n\\n"@.
 blankline :: Doc
-blankline = Doc $ singleton BlankLine
+blankline = Doc $ singleton (BlankLines 1)
+
+-- | Inserts a blank lines unless they exists already.
+-- (@blanklines m <> blanklines n@ has the same effect as @blankline (max m n)@.
+blanklines :: Int -> Doc
+blanklines n = Doc $ singleton (BlankLines n)
 
 -- | Uses the specified string as a prefix for every line of
 -- the inside document (except the first, if not at the beginning
@@ -522,4 +534,4 @@ charWidth c =
 -- | Get real length of string, taking into account combining and double-wide
 -- characters.
 realLength :: String -> Int
-realLength = sum . map charWidth
+realLength = foldr (\a b -> charWidth a + b) 0

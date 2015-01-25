@@ -1,7 +1,7 @@
 $if(has-tables)$
 .\"t
 $endif$
-.TH PANDOC 1 "$date$" "$title$"
+.TH PANDOC 1 "$date$" "$version$"
 .SH NAME
 pandoc - general markup converter
 $body$
@@ -10,7 +10,7 @@ For a complete description of pandoc's extensions to standard markdown,
 see \f[C]pandoc_markdown\f[] (5).
 .SH SEE ALSO
 .PP
-\f[C]markdown2pdf\f[] (1), \f[C]pandoc_markdown\f[] (5).
+\f[C]pandoc_markdown\f[] (5).
 .PP
 The Pandoc source code and all documentation may be downloaded
 from <http://johnmacfarlane.net/pandoc/>.
